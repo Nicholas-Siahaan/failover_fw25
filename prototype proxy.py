@@ -64,7 +64,7 @@ def get_quality():
             return 0.0, recv_count, lost_count
         return (recv_count / total) * 100.0, recv_count, lost_count
 
-reliable_queue = queue.Queue(maxsize=1024)
+# reliable_queue = queue.Queue(maxsize=8192)
 
 def mav_to_udp_loop(mav, stop_event, udp_out):
     while not stop_event.is_set():
@@ -75,10 +75,8 @@ def mav_to_udp_loop(mav, stop_event, udp_out):
 
             check_link_quality(msg)
 
-            if msg.get_type() in ["PARAM_VALUE", "MISSION_ITEM"]:
-                reliable_queue.put(msg.get_msgbuf())
-            else:
-                udp_out.sendto(msg.get_msgbuf(), ('127.0.0.1', UDP_PORT_MP))
+            # if msg.get_type() in ["PARAM_VALUE"]:
+            udp_out.sendto(msg.get_msgbuf(), ('127.0.0.1', UDP_PORT_MP))
             logging.debug(f"MAVLink message: {msg.get_type()}")
 
         except Exception as e:
@@ -87,23 +85,23 @@ def mav_to_udp_loop(mav, stop_event, udp_out):
             break
     logging.info("mav_to_udp_loop selesai.")
 
-def reliable_sender_loop(stop_event, udp_out):
-    while not stop_event.is_set():
-        try:
-            data = reliable_queue.get(timeout=0.5)
-            udp_out.sendto(data, ('127.0.0.1', UDP_PORT_MP))
-        except queue.Empty:
-            continue
-        except Exception as e:
-            logging.error(f"reliable_sender_loop error: {e}")
-            stop_event.set()
-            break
+# def reliable_sender_loop(stop_event, udp_out):
+#     while not stop_event.is_set():
+#         try:
+#             data = reliable_queue.get(timeout=0.5)
+#             udp_out.sendto(data, ('127.0.0.1', UDP_PORT_MP))
+#         except queue.Empty:
+#             continue
+#         except Exception as e:
+#             logging.error(f"reliable_sender_loop error: {e}")
+#             stop_event.set()
+#             break
 
 def udp_to_mav_loop(mav, stop_event, udp_in):
     udp_in.settimeout(1.0)
     while not stop_event.is_set():
         try:
-            data, _ = udp_in.recvfrom(1024)
+            data, _ = udp_in.recvfrom(2048)
             mav.write(data)
         except socket.timeout:
             continue
@@ -138,6 +136,42 @@ def log_quality_csv(stop_event, file_path="link_quality.csv"):
             writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), round(q, 3), r, l])
             csvfile.flush()
             time.sleep(0.5)
+
+param_queue = queue.Queue(maxsize=1024)
+param_timeout = 2
+
+def param_receiver_loop(mav, stop_event):
+    last_param_time = time.time()
+    while not stop_event.is_set():
+        try:
+            msg = mav.recv_match(type='PARAM_VALUE', blocking=False)
+            if msg:
+                last_param_time = time.time()
+                try:
+                    param_queue.put_nowait(msg.get_msgbuf())
+                except queue.Full:
+                    logging.warning("Param queue penuh, PARAM_VALUE dilewati")
+                logging.debug(f"PARAM_VALUE diterima: {msg.param_id}")
+            else:
+                if time.time() - last_param_time > param_timeout:
+                    logging.warning("PARAM_VALUE timeout, lanjutkan")
+                    last_param_time = time.time()
+            time.sleep(0.001)
+        except Exception as e:
+            logging.error(f"param_receiver_loop error: {e}")
+            time.sleep(0.1)
+
+def param_sender_loop(stop_event, udp_out):
+    while not stop_event.is_set():
+        try:
+            data = param_queue.get(timeout=0.5)
+            udp_out.sendto(data, ('127.0.0.1', UDP_PORT_MP))
+        except queue.Empty:
+            continue
+        except Exception as e:
+            logging.error(f"param_sender_loop error: {e}")
+            stop_event.set()
+            break
 
 def main():
     ports = list(serial.tools.list_ports.comports())
@@ -188,11 +222,12 @@ def main():
             udp_in.bind(('0.0.0.0', UDP_PORT_MAV))
 
             t1 = threading.Thread(target=mav_to_udp_loop, args=(mav, stop_event, udp_out), daemon=True)
-            t2 = threading.Thread(target=reliable_sender_loop, args=(stop_event, udp_out), daemon=True)
-            t3 = threading.Thread(target=udp_to_mav_loop, args=(mav, stop_event, udp_in), daemon=True)
-            t4 = threading.Thread(target=link_quality_monitor, args=(stop_event,), daemon=True)
-            t5 = threading.Thread(target=log_quality_csv, args=(stop_event,), daemon=True)
-            t6 = threading.Thread(target=udp_quality_broadcast, args=(stop_event,), daemon=True)
+            t2 = threading.Thread(target=param_sender_loop, args=(stop_event, udp_out), daemon=True)
+            t3 = threading.Thread(target=param_receiver_loop, args=(mav, stop_event), daemon=True)
+            t4 = threading.Thread(target=udp_to_mav_loop, args=(mav, stop_event, udp_in), daemon=True)
+            t5 = threading.Thread(target=link_quality_monitor, args=(stop_event,), daemon=True)
+            t6 = threading.Thread(target=log_quality_csv, args=(stop_event,), daemon=True)
+            t7 = threading.Thread(target=udp_quality_broadcast, args=(stop_event,), daemon=True)
 
             t1.start()
             t2.start()
@@ -200,6 +235,7 @@ def main():
             t4.start()
             t5.start()
             t6.start()
+            t7.start()
 
             while not stop_event.is_set():
                 if not t1.is_alive() or not t2.is_alive() or not t3.is_alive():
