@@ -14,19 +14,32 @@ import queue
 TELEMETRY_PORT = 'COM3'
 BAUD = 57600
 UDP_PORT_MAV = 1802
-UDP_PORT_MP  = 1805
-LINK_QUALITY_PORT = 19000 
+UDP_PORT_MP = 1805
+LINK_QUALITY_PORT = 19000
+
 TIMEOUT = 5
+PARAM_TIMEOUT = 1.0
+RETRIES = 3
+total_params = 0
+IMPORTANT_PARAMS = ["BARO2_GND_PRESS", "STAT_RUNTIME", "NMEA_MSG_EN"]
+
+DUMMY_PARAMS = {
+    "BARO2_GND_PRESS": 0.0,
+    "STAT_RUNTIME": 0.0,
+    "NMEA_MSG_EN": 0.0,
+}
+
+param_queue = queue.Queue()
+reliable_queue = queue.Queue(maxsize=1024)
 
 logging.basicConfig(
     level=logging.DEBUG,
-    format='%(asctime)s [%(levelname)s] %(message)s',
+    format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         RotatingFileHandler("proxy.log", maxBytes=1_000_000, backupCount=3),
         logging.StreamHandler()
     ]
 )
-
 def beep():
     try:
         if platform.system() == "Windows":
@@ -48,6 +61,7 @@ def check_link_quality(msg):
         seq = msg.get_seq()
     except:
         return
+
     with lock:
         if last_seq is not None:
             expected = (last_seq + 1) % 256
@@ -64,8 +78,6 @@ def get_quality():
             return 0.0, recv_count, lost_count
         return (recv_count / total) * 100.0, recv_count, lost_count
 
-reliable_queue = queue.Queue(maxsize=1024)
-
 def mav_to_udp_loop(mav, stop_event, udp_out):
     while not stop_event.is_set():
         try:
@@ -74,11 +86,21 @@ def mav_to_udp_loop(mav, stop_event, udp_out):
                 continue
 
             check_link_quality(msg)
+            buf = msg.get_msgbuf()
+            if not buf or len(buf) == 0:
+                continue
 
-            if msg.get_type() in ["PARAM_VALUE", "MISSION_ITEM"]:
-                reliable_queue.put(msg.get_msgbuf())
-            else:
-                udp_out.sendto(msg.get_msgbuf(), ('127.0.0.1', UDP_PORT_MP))
+            if msg.get_type() == "PARAM_VALUE":
+                try:
+                    param_queue.put_nowait(msg)
+                except queue.Full:
+                    logging.warning("Queue penuh, paket PARAM_VALUE terlewat")
+                try:
+                    handle_param_value(msg)
+                except Exception as e:
+                    logging.error(f"Error handling PARAM_VALUE: {e}")
+            udp_out.sendto(buf, ('127.0.0.1', UDP_PORT_MP))
+
             logging.debug(f"MAVLink message: {msg.get_type()}")
 
         except Exception as e:
@@ -98,13 +120,28 @@ def reliable_sender_loop(stop_event, udp_out):
             logging.error(f"reliable_sender_loop error: {e}")
             stop_event.set()
             break
+    logging.info("reliable_sender_loop selesai.")
 
 def udp_to_mav_loop(mav, stop_event, udp_in):
     udp_in.settimeout(1.0)
     while not stop_event.is_set():
         try:
             data, _ = udp_in.recvfrom(1024)
+            try:
+                msg = mav.decode(data)
+            except Exception:
+                msg = None
+
+            if msg and msg.get_type() == "PARAM_REQUEST_READ":
+                param_id = msg.param_id.decode().strip("\x00")
+                if param_id in DUMMY_PARAMS:
+                    dummy_value = DUMMY_PARAMS[param_id]
+                    logging.warning(f"[DUMMY] MP request {param_id}, balas dummy {dummy_value}")
+                    send_dummy_param(mav, param_id, dummy_value)
+                    continue
+
             mav.write(data)
+
         except socket.timeout:
             continue
         except ConnectionResetError:
@@ -139,6 +176,91 @@ def log_quality_csv(stop_event, file_path="link_quality.csv"):
             csvfile.flush()
             time.sleep(0.5)
 
+def request_params(mav, param_names):
+    global total_params
+    for pname in param_names:
+        retries = RETRIES
+        received = False
+        while retries > 0 and not received:
+            try:
+                mav.mav.param_request_read_send(
+                    mav.target_system,
+                    mav.target_component,
+                    pname.encode(),
+                    -1
+                )
+            except Exception as e:
+                logging.error(f"Gagal kirim PARAM_REQUEST_READ {pname}: {e}")
+                break
+
+            start_time = time.time()
+            while time.time() - start_time < PARAM_TIMEOUT:
+                try:
+                    msg = param_queue.get(timeout=0.05)
+                    if msg.get_type() == "PARAM_VALUE":
+                        total_params = msg.param_count
+                        param_id = msg.param_id.decode().strip('\x00')
+                        if param_id == pname:
+                            logging.info(f"Got param {pname} = {msg.param_value}")
+                            received = True
+                            break
+
+                except queue.Empty:
+                    continue
+
+            if not received:
+                retries -= 1
+                if retries > 0:
+                    logging.warning(f"Retry param {pname}...")
+                else:
+                    logging.error(f"Param {pname} gagal diterima setelah 3 retry")
+                    send_dummy_param(mav, pname)
+
+param_store = {}
+param_total = None
+next_dummy_index = 0
+
+def handle_param_value(msg):
+    global param_total
+    pname = msg.param_id.decode('utf-8').strip()
+    param_store[pname] = (msg.param_value, msg.param_type, msg.param_index)
+
+    if param_total is None:
+        param_total = msg.param_count
+
+def send_dummy_param(mav, pname, value=0.0):
+    global next_dummy_index, param_total
+    if param_total is None:
+        param_total = 500  # fallback default
+
+    # assign index dummy berikutnya
+    idx = next_dummy_index
+    next_dummy_index += 1
+
+    mav.mav.param_value_send(
+        pname.encode(),
+        value,
+        mavutil.mavlink.MAV_PARAM_TYPE_REAL32,
+        param_total,
+        idx
+    )
+    logging.warning(f"[DUMMY] Kirim {pname} = {value} idx={idx}/{param_total}")
+
+def handle_param_request_read(msg, mav):
+    pname = msg.param_id.decode('utf-8').strip()
+    if pname in param_store:
+        val, ptype, idx = param_store[pname]
+        mav.mav.param_value_send(
+            pname.encode(),
+            val,
+            ptype,
+            param_total,
+            idx
+        )
+    else:
+        # tidak ada → kirim dummy
+        send_dummy_param(mav, pname)
+
 def main():
     ports = list(serial.tools.list_ports.comports())
     print("Port serial yang terdeteksi:")
@@ -149,43 +271,29 @@ def main():
         try:
             logging.info(f"Mencoba koneksi ke {TELEMETRY_PORT}...")
             mav = mavutil.mavlink_connection(TELEMETRY_PORT, baud=BAUD)
-            
             start_time = time.time()
             heartbeat_received = False
             while time.time() - start_time < TIMEOUT:
-                msg = mav.recv_match(type='HEARTBEAT', blocking=False)
+                msg = mav.recv_match(type="HEARTBEAT", blocking=False)
                 if msg:
                     heartbeat_received = True
                     break
                 time.sleep(0.01)
 
-            if heartbeat_received:
-                logging.info("[OK] Heartbeat diterima dari telemetry")
-                beep()
-                try:
-                    mav.mav.param_request_list_send(
-                        mav.target_system,
-                        mav.target_component
-                        # b'BARO2_GND_PRESS', 
-                        # -1
-                    )
-                    logging.info("PARAM_REQUEST_LIST dikirim ke autopilot")
-                except Exception as e:
-                    logging.error(f"Gagal kirim PARAM_REQUEST_LIST: {e}")
-            else:
-                logging.warning("Tidak ada heartbeat dari telemetry, coba ulang...")
-                try:
-                    mav.close()
-                except:
-                    pass
-                time.sleep(1)
-                continue
+            mtype = msg.get_type()
+            if mtype == "PARAM_VALUE":
+                handle_param_value(msg)
 
+            elif mtype == "PARAM_REQUEST_READ":
+                handle_param_request_read(mav, msg)
+
+            else:
+                logging.debug(f"MAVLink message: {mtype}")
             stop_event = threading.Event()
             udp_out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            udp_in  = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            udp_in = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             udp_in.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            udp_in.bind(('0.0.0.0', UDP_PORT_MAV))
+            udp_in.bind(("0.0.0.0", UDP_PORT_MAV))
 
             t1 = threading.Thread(target=mav_to_udp_loop, args=(mav, stop_event, udp_out), daemon=True)
             t2 = threading.Thread(target=reliable_sender_loop, args=(stop_event, udp_out), daemon=True)
@@ -194,12 +302,8 @@ def main():
             t5 = threading.Thread(target=log_quality_csv, args=(stop_event,), daemon=True)
             t6 = threading.Thread(target=udp_quality_broadcast, args=(stop_event,), daemon=True)
 
-            t1.start()
-            t2.start()
-            t3.start()
-            t4.start()
-            t5.start()
-            t6.start()
+            for t in [t1, t2, t3, t4, t5, t6]:
+                t.start()
 
             while not stop_event.is_set():
                 if not t1.is_alive() or not t2.is_alive() or not t3.is_alive():
@@ -221,6 +325,7 @@ def main():
         except Exception as e:
             logging.error(f"Error utama: {e}")
             time.sleep(3)
+
 
 if __name__ == "__main__":
     main()
