@@ -10,13 +10,24 @@ from datetime import datetime
 import serial.tools.list_ports
 import queue
 
-TELEMETRY_PORT = 'COM3'
-BAUD = 57600
+TELEMETRY_PORT = 'COM3' #liat di device manager untuk tau com nya
+BAUD = 57600 # umumnya itu
 UDP_PORT_MAV = 1802
-UDP_PORT_MP  = 1805
-LINK_QUALITY_PORT = 19000
+UDP_PORT_MP  = 1805 # nanti masukkan ke MP itu kalo mau di tes
+LINK_QUALITY_PORT = 19000 # nanti sesuaikan dengan program failover
 TIMEOUT = 5
-
+QUEUE_MAX = 1024
+param_queue = queue.Queue(maxsize=QUEUE_MAX)
+param_rate = 0.5
+# param value yang sering stuck
+SKIP_PARAMS = {
+    "NMEA_MSG_EN",
+    "NMEA_RATE_MS",
+    "STAT_RUNTIME",
+    "BARO1_GND_PRESS",
+    "BARO2_GND_PRESS"
+}
+# Logging
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -26,6 +37,7 @@ logging.basicConfig(
     ]
 )
 
+# beep biar tau com kebaca atau ga
 def beep():
     try:
         if platform.system() == "Windows":
@@ -36,7 +48,6 @@ def beep():
     except:
         logging.warning("Tidak bisa memutar beep")
 
-# --- Link quality ---
 last_seq = None
 recv_count = 0
 lost_count = 0
@@ -52,8 +63,7 @@ def check_link_quality(msg):
         if last_seq is not None:
             expected = (last_seq + 1) % 256
             if seq != expected:
-                gap = (seq - expected) % 256
-                lost_count += gap
+                lost_count += (seq - expected) % 256
         last_seq = seq
         recv_count += 1
 
@@ -64,58 +74,44 @@ def get_quality():
             return 0.0, recv_count, lost_count
         return (recv_count / total) * 100.0, recv_count, lost_count
 
-# --- PARAM_VALUE queue untuk logging/failover ---
-param_queue = queue.Queue(maxsize=2048)
-param_retry = {}
-param_timeout = 2
-param_max_retry = 3
-param_rate = 0.001
-
 def param_receiver_loop(mav, stop_event):
     last_param_time = time.time()
     while not stop_event.is_set():
         try:
             msg = mav.recv_match(type='PARAM_VALUE', blocking=False)
             if msg:
-                param_id = msg.param_id
                 last_param_time = time.time()
-
-                # Cek retry count
-                count = param_retry.get(param_id, 0)
-                if count >= param_max_retry:
-                    logging.warning(f"PARAM_VALUE {param_id} terlalu sering diulang, skip")
+                pid = msg.param_id.decode("utf-8", errors="ignore").strip("\x00")
+                if pid in SKIP_PARAMS:
+                    logging.warning(f"PARAM_VALUE {msg.param_id} di-skip agar tidak bikin MP stuck")
                     continue
-
                 try:
                     param_queue.put_nowait(msg.get_msgbuf())
-                    param_retry[param_id] = count + 1
                 except queue.Full:
-                    logging.warning("Param queue penuh, PARAM_VALUE dilewati")
-
-                logging.debug(f"PARAM_VALUE diterima: {param_id}")
+                    logging.warning(f"Param queue penuh, PARAM_VALUE {msg.param_id} dilewati")
+                logging.debug(f"PARAM_VALUE diterima: {msg.param_id}")
             else:
-                if time.time() - last_param_time > param_timeout:
-                    last_param_time = time.time()
+                if time.time() - last_param_time > 2:
                     logging.debug("PARAM_VALUE timeout, lanjutkan")
+                    last_param_time = time.time()
             time.sleep(0.001)
         except Exception as e:
             logging.error(f"param_receiver_loop error: {e}")
             time.sleep(0.1)
 
-def param_sender_loop(stop_event, udp_out):
-    while not stop_event.is_set():
-        try:
-            data = param_queue.get(timeout=0.5)
-            udp_out.sendto(data, ('127.0.0.1', UDP_PORT_MP))
-            time.sleep(param_rate)
-        except queue.Empty:
-            continue
-        except Exception as e:
-            logging.error(f"param_sender_loop error: {e}")
-            stop_event.set()
-            break
+# def param_sender_loop(stop_event, udp_out):
+#     while not stop_event.is_set():
+#         try:
+#             data = param_queue.get(timeout=0.5)
+#             udp_out.sendto(data, ('127.0.0.1', UDP_PORT_MP))
+#             time.sleep(param_rate)
+#         except queue.Empty:
+#             continue
+#         except Exception as e:
+#             logging.error(f"param_sender_loop error: {e}")
+#             stop_event.set()
+#             break
 
-# --- Semua paket MAVLink ke MP ---
 def mav_to_udp_loop(mav, stop_event, udp_out):
     while not stop_event.is_set():
         try:
@@ -125,8 +121,16 @@ def mav_to_udp_loop(mav, stop_event, udp_out):
 
             check_link_quality(msg)
 
-            # Kirim semua paket ke MP
+            # if msg.get_type() == "PARAM_VALUE":
+            #     pid = msg.param_id.decode("utf-8", errors="ignore").strip("\x00")
+            #     if pid not in SKIP_PARAMS:
+            #         logging.warning(f"PARAM_VALUE {msg.param_id} di-skip agar tidak bikin MP stuck")
+            #         continue
+            #     logging.debug(f"PARAM_VALUE diterima: {msg.param_id}")
+            logging.debug(f"{msg}")
             udp_out.sendto(msg.get_msgbuf(), ('127.0.0.1', UDP_PORT_MP))
+
+            time.sleep(0.001)
         except Exception as e:
             logging.error(f"mav_to_udp_loop error: {e}")
             stop_event.set()
@@ -141,15 +145,12 @@ def udp_to_mav_loop(mav, stop_event, udp_in):
             mav.write(data)
         except socket.timeout:
             continue
-        except ConnectionResetError:
-            continue
         except Exception as e:
             logging.error(f"udp_to_mav_loop error: {e}")
             stop_event.set()
             break
     logging.info("udp_to_mav_loop selesai.")
 
-# --- Link quality monitor ---
 def link_quality_monitor(stop_event):
     while not stop_event.is_set():
         time.sleep(5)
@@ -174,7 +175,6 @@ def log_quality_csv(stop_event, file_path="link_quality.csv"):
             csvfile.flush()
             time.sleep(0.5)
 
-# --- Main ---
 def main():
     ports = list(serial.tools.list_ports.comports())
     print("Port serial yang terdeteksi:")
@@ -183,9 +183,16 @@ def main():
 
     while True:
         try:
+            stop_event = threading.Event()
+            udp_out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            udp_in  = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            udp_in.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            udp_in.bind(('0.0.0.0', UDP_PORT_MAV))
+
             logging.info(f"Mencoba koneksi ke {TELEMETRY_PORT}...")
             mav = mavutil.mavlink_connection(TELEMETRY_PORT, baud=BAUD)
             
+            # Cek heartbeat
             start_time = time.time()
             heartbeat_received = False
             while time.time() - start_time < TIMEOUT:
@@ -195,36 +202,16 @@ def main():
                     break
                 time.sleep(0.01)
 
-            if heartbeat_received:
-                logging.info("[OK] Heartbeat diterima dari telemetry")
-                beep()
-                try:
-                    mav.mav.param_request_list_send(
-                        mav.target_system,
-                        mav.target_component
-                    )
-                    logging.info("PARAM_REQUEST_LIST dikirim ke autopilot")
-                except Exception as e:
-                    logging.error(f"Gagal kirim PARAM_REQUEST_LIST: {e}")
-            else:
-                logging.warning("Tidak ada heartbeat dari telemetry, coba ulang...")
-                try:
-                    mav.close()
-                except:
-                    pass
-                time.sleep(1)
-                continue
-
-            stop_event = threading.Event()
-            udp_out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            udp_in  = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            udp_in.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            udp_in.bind(('0.0.0.0', UDP_PORT_MAV))
+            if not heartbeat_received:
+                logging.error("Tidak ada heartbeat, keluar")
+                return
+            logging.info("Heartbeat diterima, kirim PARAM_REQUEST_LIST")
+            mav.mav.param_request_list_send(mav.target_system, mav.target_component)
 
             threads = [
                 threading.Thread(target=mav_to_udp_loop, args=(mav, stop_event, udp_out), daemon=True),
-                threading.Thread(target=param_receiver_loop, args=(mav, stop_event), daemon=True),
-                threading.Thread(target=param_sender_loop, args=(stop_event, udp_out), daemon=True),
+                # threading.Thread(target=param_receiver_loop, args=(mav, stop_event), daemon=True),
+                # threading.Thread(target=param_sender_loop, args=(stop_event, udp_out), daemon=True),
                 threading.Thread(target=udp_to_mav_loop, args=(mav, stop_event, udp_in), daemon=True),
                 threading.Thread(target=link_quality_monitor, args=(stop_event,), daemon=True),
                 threading.Thread(target=log_quality_csv, args=(stop_event,), daemon=True),
