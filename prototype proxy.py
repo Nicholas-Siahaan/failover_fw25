@@ -16,17 +16,10 @@ UDP_PORT_MAV = 1802
 UDP_PORT_MP  = 1805 # nanti masukkan ke MP itu kalo mau di tes
 LINK_QUALITY_PORT = 19000 # nanti sesuaikan dengan program failover
 TIMEOUT = 5
-QUEUE_MAX = 1024
+QUEUE_MAX = 8192
 param_queue = queue.Queue(maxsize=QUEUE_MAX)
 param_rate = 0.5
-# param value yang sering stuck
-SKIP_PARAMS = {
-    "NMEA_MSG_EN",
-    "NMEA_RATE_MS",
-    "STAT_RUNTIME",
-    "BARO1_GND_PRESS",
-    "BARO2_GND_PRESS"
-}
+PARAM_TIMEOUT = 30
 # Logging
 logging.basicConfig(
     level=logging.DEBUG,
@@ -74,45 +67,11 @@ def get_quality():
             return 0.0, recv_count, lost_count
         return (recv_count / total) * 100.0, recv_count, lost_count
 
-def param_receiver_loop(mav, stop_event):
-    last_param_time = time.time()
-    while not stop_event.is_set():
-        try:
-            msg = mav.recv_match(type='PARAM_VALUE', blocking=False)
-            if msg:
-                last_param_time = time.time()
-                pid = msg.param_id.decode("utf-8", errors="ignore").strip("\x00")
-                if pid in SKIP_PARAMS:
-                    logging.warning(f"PARAM_VALUE {msg.param_id} di-skip agar tidak bikin MP stuck")
-                    continue
-                try:
-                    param_queue.put_nowait(msg.get_msgbuf())
-                except queue.Full:
-                    logging.warning(f"Param queue penuh, PARAM_VALUE {msg.param_id} dilewati")
-                logging.debug(f"PARAM_VALUE diterima: {msg.param_id}")
-            else:
-                if time.time() - last_param_time > 2:
-                    logging.debug("PARAM_VALUE timeout, lanjutkan")
-                    last_param_time = time.time()
-            time.sleep(0.001)
-        except Exception as e:
-            logging.error(f"param_receiver_loop error: {e}")
-            time.sleep(0.1)
 
-# def param_sender_loop(stop_event, udp_out):
-#     while not stop_event.is_set():
-#         try:
-#             data = param_queue.get(timeout=0.5)
-#             udp_out.sendto(data, ('127.0.0.1', UDP_PORT_MP))
-#             time.sleep(param_rate)
-#         except queue.Empty:
-#             continue
-#         except Exception as e:
-#             logging.error(f"param_sender_loop error: {e}")
-#             stop_event.set()
-#             break
-
-def mav_to_udp_loop(mav, stop_event, udp_out):
+def mav_to_udp_loop(mav, stop_event, udp_out, last_param_time):
+    total_param = None
+    expected_index = 0
+    buffer = {}
     while not stop_event.is_set():
         try:
             msg = mav.recv_match(blocking=False)
@@ -120,21 +79,31 @@ def mav_to_udp_loop(mav, stop_event, udp_out):
                 continue
 
             check_link_quality(msg)
+            if msg.get_type() == "PARAM_VALUE":
+                last_param_time[0] = time.time()
+                if total_param is None:
+                    total_param = msg.param_count
+                    logging.info(f"[PARAM] Total param: {total_param}")
+                idx = msg.param_index
+                buffer[idx] = msg
+                while expected_index in buffer:
+                    m = buffer.pop(expected_index)
+                    logging.info(f"[PARAM] {m.param_index}/{total_param-1} {m.param_id} = {m.param_value}")
+                    udp_out.sendto(m.get_msgbuf(), ('127.0.0.1', UDP_PORT_MP))
+                    expected_index += 1
 
-            # if msg.get_type() == "PARAM_VALUE":
-            #     pid = msg.param_id.decode("utf-8", errors="ignore").strip("\x00")
-            #     if pid not in SKIP_PARAMS:
-            #         logging.warning(f"PARAM_VALUE {msg.param_id} di-skip agar tidak bikin MP stuck")
-            #         continue
-            #     logging.debug(f"PARAM_VALUE diterima: {msg.param_id}")
-            logging.debug(f"{msg}")
-            udp_out.sendto(msg.get_msgbuf(), ('127.0.0.1', UDP_PORT_MP))
+                if expected_index >= total_param:
+                    logging.info("[PARAM] Semua parameter sudah diteruskan ke MP")
+            else:
+                udp_out.sendto(msg.get_msgbuf(), ('127.0.0.1', UDP_PORT_MP))
 
             time.sleep(0.001)
+
         except Exception as e:
             logging.error(f"mav_to_udp_loop error: {e}")
             stop_event.set()
             break
+
     logging.info("mav_to_udp_loop selesai.")
 
 def udp_to_mav_loop(mav, stop_event, udp_in):
@@ -150,6 +119,13 @@ def udp_to_mav_loop(mav, stop_event, udp_in):
             stop_event.set()
             break
     logging.info("udp_to_mav_loop selesai.")
+
+def param_monitor(stop_event, last_param_time):
+    while not stop_event.is_set():
+        if time.time() - last_param_time[0] > PARAM_TIMEOUT:
+            logging.info("[PARAM] Timeout param, dianggap selesai")
+            break
+        time.sleep(1)
 
 def link_quality_monitor(stop_event):
     while not stop_event.is_set():
@@ -208,11 +184,11 @@ def main():
             logging.info("Heartbeat diterima, kirim PARAM_REQUEST_LIST")
             mav.mav.param_request_list_send(mav.target_system, mav.target_component)
 
+            last_param_time = [time.time()]
             threads = [
-                threading.Thread(target=mav_to_udp_loop, args=(mav, stop_event, udp_out), daemon=True),
-                # threading.Thread(target=param_receiver_loop, args=(mav, stop_event), daemon=True),
-                # threading.Thread(target=param_sender_loop, args=(stop_event, udp_out), daemon=True),
+                threading.Thread(target=mav_to_udp_loop, args=(mav, stop_event, udp_out, last_param_time), daemon=True),
                 threading.Thread(target=udp_to_mav_loop, args=(mav, stop_event, udp_in), daemon=True),
+                threading.Thread(target=param_monitor, args=(stop_event, last_param_time), daemon=True),
                 threading.Thread(target=link_quality_monitor, args=(stop_event,), daemon=True),
                 threading.Thread(target=log_quality_csv, args=(stop_event,), daemon=True),
                 threading.Thread(target=udp_quality_broadcast, args=(stop_event,), daemon=True)
