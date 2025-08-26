@@ -23,6 +23,8 @@ param_rate = 0.5
 expected_index = 0
 total_param = None
 PARAM_TIMEOUT = 30
+last_seen_time = time.time()
+param_sync_done = False
 
 
 
@@ -74,29 +76,57 @@ def get_quality():
 
 
 def mav_to_udp_loop(mav, stop_event, udp_out, last_param_time):
-    global buffer, expected_index, total_param
+    global buffer, expected_index, total_param, last_seen_time, param_sync_done
+    param_timeout = 5.0
     while not stop_event.is_set():
         try:
             msg = mav.recv_match(blocking=False)
             if not msg or msg.get_type() == "BAD_DATA":
+                if (not param_sync_done) and (time.time() - last_param_time[0] > param_timeout):
+                    logging.info("[PARAM] Timeout param, dianggap selesai")
+                    param_sync_done = True
                 continue
 
             check_link_quality(msg)
             if msg.get_type() == "PARAM_VALUE":
+                if param_sync_done:
+                    logging.debug(f"[PARAM] Extra param setelah sync: {msg.param_id}")
+                    continue
                 last_param_time[0] = time.time()
                 if total_param is None:
                     total_param = msg.param_count
                     logging.info(f"[PARAM] Total param: {total_param}")
                 idx = msg.param_index
+                
+                if idx < 0 or idx >= 65535:
+                    if total_param and expected_index >= total_param:
+                        logging.debug(f"[PARAM] Index invalid {idx} ({msg.param_id}) diabaikan karena param sudah selesai")
+                        continue
+                    else:
+                        logging.debug(f"[PARAM] Index invalid {idx}, tetap forward: {msg.param_id}")
+                        udp_out.sendto(msg.get_msgbuf(), ('127.0.0.1', UDP_PORT_MP))
+                    continue
                 buffer[idx] = msg
                 while expected_index in buffer:
                     m = buffer.pop(expected_index)
                     logging.info(f"[PARAM] {m.param_index}/{total_param-1} {m.param_id} = {m.param_value}")
                     udp_out.sendto(m.get_msgbuf(), ('127.0.0.1', UDP_PORT_MP))
                     expected_index += 1
+                    last_seen_time = time.time()
+                
+                if (time.time() - last_seen_time) > 2.0 and buffer:
+                    next_idx = min(buffer.keys())
+                    m = buffer.pop(next_idx)
+                    logging.warning(f"[PARAM] Timeout index {expected_index}, lepas {m.param_index} {m.param_id}")
+                    udp_out.sendto(m.get_msgbuf(), ('127.0.0.1', UDP_PORT_MP))
+                    expected_index = next_idx + 1
+                    last_seen_time = time.time()
+
 
                 if total_param is not None and expected_index >= total_param:
                     logging.info("[PARAM] Semua parameter sudah diteruskan ke MP")
+                    param_sync_done = True
+                    continue
             else:
                 udp_out.sendto(msg.get_msgbuf(), ('127.0.0.1', UDP_PORT_MP))
 
@@ -123,44 +153,11 @@ def udp_to_mav_loop(mav, stop_event, udp_in):
             break
     logging.info("udp_to_mav_loop selesai.")
 
-# def param_forwarder(stop_event, udp_out):
-#     buffer = {}
-#     expected_index = 0
-#     total_param = None
-
-#     while not stop_event.is_set():
-#         try:
-#             msg = param_queue.get(timeout=1)
-#             if total_param is None:
-#                 total_param = msg.param_count
-#                 logging.info(f"[PARAM] Total param: {total_param}")
-
-#             idx = msg.param_index
-#             buffer[idx] = msg
-
-#             # keluarkan secara urut
-#             while expected_index in buffer:
-#                 m = buffer.pop(expected_index)
-#                 logging.info(f"[PARAM] {m.param_index}/{total_param-1} {m.param_id} = {m.param_value}")
-#                 udp_out.sendto(m.get_msgbuf(), ('127.0.0.1', UDP_PORT_MP))
-#                 expected_index += 1
-
-#             if total_param is not None and expected_index >= total_param:
-#                 logging.info("[PARAM] Semua parameter sudah diteruskan ke MP")
-#                 break
-
-#         except queue.Empty:
-#             continue
-#         except Exception as e:
-#             logging.error(f"param_forwarder error: {e}")
-#             stop_event.set()
-#             break
-#     logging.info("param_forwarder selesai.")
-
 def param_monitor(stop_event, last_param_time):
     while not stop_event.is_set():
         if time.time() - last_param_time[0] > PARAM_TIMEOUT:
             logging.info("[PARAM] Timeout param, dianggap selesai")
+            param_sync_done = True
             break
         time.sleep(1)
 
