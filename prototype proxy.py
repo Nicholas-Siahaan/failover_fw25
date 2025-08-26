@@ -18,9 +18,14 @@ LINK_QUALITY_PORT = 19000 # nanti sesuaikan dengan program failover
 TIMEOUT = 5
 QUEUE_MAX = 8192
 param_queue = queue.Queue(maxsize=QUEUE_MAX)
+buffer = {}
 param_rate = 0.5
+expected_index = 0
+total_param = None
 PARAM_TIMEOUT = 30
-# Logging
+
+
+
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -69,9 +74,7 @@ def get_quality():
 
 
 def mav_to_udp_loop(mav, stop_event, udp_out, last_param_time):
-    total_param = None
-    expected_index = 0
-    buffer = {}
+    global buffer, expected_index, total_param
     while not stop_event.is_set():
         try:
             msg = mav.recv_match(blocking=False)
@@ -92,7 +95,7 @@ def mav_to_udp_loop(mav, stop_event, udp_out, last_param_time):
                     udp_out.sendto(m.get_msgbuf(), ('127.0.0.1', UDP_PORT_MP))
                     expected_index += 1
 
-                if expected_index >= total_param:
+                if total_param is not None and expected_index >= total_param:
                     logging.info("[PARAM] Semua parameter sudah diteruskan ke MP")
             else:
                 udp_out.sendto(msg.get_msgbuf(), ('127.0.0.1', UDP_PORT_MP))
@@ -119,6 +122,40 @@ def udp_to_mav_loop(mav, stop_event, udp_in):
             stop_event.set()
             break
     logging.info("udp_to_mav_loop selesai.")
+
+# def param_forwarder(stop_event, udp_out):
+#     buffer = {}
+#     expected_index = 0
+#     total_param = None
+
+#     while not stop_event.is_set():
+#         try:
+#             msg = param_queue.get(timeout=1)
+#             if total_param is None:
+#                 total_param = msg.param_count
+#                 logging.info(f"[PARAM] Total param: {total_param}")
+
+#             idx = msg.param_index
+#             buffer[idx] = msg
+
+#             # keluarkan secara urut
+#             while expected_index in buffer:
+#                 m = buffer.pop(expected_index)
+#                 logging.info(f"[PARAM] {m.param_index}/{total_param-1} {m.param_id} = {m.param_value}")
+#                 udp_out.sendto(m.get_msgbuf(), ('127.0.0.1', UDP_PORT_MP))
+#                 expected_index += 1
+
+#             if total_param is not None and expected_index >= total_param:
+#                 logging.info("[PARAM] Semua parameter sudah diteruskan ke MP")
+#                 break
+
+#         except queue.Empty:
+#             continue
+#         except Exception as e:
+#             logging.error(f"param_forwarder error: {e}")
+#             stop_event.set()
+#             break
+#     logging.info("param_forwarder selesai.")
 
 def param_monitor(stop_event, last_param_time):
     while not stop_event.is_set():
@@ -187,6 +224,7 @@ def main():
             last_param_time = [time.time()]
             threads = [
                 threading.Thread(target=mav_to_udp_loop, args=(mav, stop_event, udp_out, last_param_time), daemon=True),
+                # threading.Thread(target=param_forwarder, args=(stop_event, udp_out), daemon=True),
                 threading.Thread(target=udp_to_mav_loop, args=(mav, stop_event, udp_in), daemon=True),
                 threading.Thread(target=param_monitor, args=(stop_event, last_param_time), daemon=True),
                 threading.Thread(target=link_quality_monitor, args=(stop_event,), daemon=True),
@@ -198,11 +236,17 @@ def main():
                 t.start()
 
             while not stop_event.is_set():
-                if not any(t.is_alive() for t in threads[:4]):
-                    logging.error("Thread utama mati, restart...")
-                    stop_event.set()
+                if total_param and time.time() - last_param_time[0] > 30:
+                    logging.info("[PARAM] Timeout tercapai, hentikan request param.")
                     break
                 time.sleep(1)
+        except KeyboardInterrupt:
+            stop_event.set()
+                # if not any(t.is_alive() for t in threads[:4]):
+                #     logging.error("Thread utama mati, restart...")
+                #     stop_event.set()
+                #     break
+                # time.sleep(1)
 
             try:
                 mav.close()
