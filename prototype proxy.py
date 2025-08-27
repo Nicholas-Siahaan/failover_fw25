@@ -60,14 +60,16 @@ def get_quality():
             return 0.0, recv_count, lost_count
         return (recv_count / total) * 100.0, recv_count, lost_count
 
-def mav_to_udp_loop(mav, stop_event, udp_out, last_param_time, first_data_time, param_requested):
-    global buffer, expected_index, total_param
-    param_timeouts = {}
-
+def mav_to_udp_loop(mav, stop_event, udp_out, last_param_time):
+    global buffer, expected_index, total_param, last_seen_time, param_sync_done
+    param_timeout = 5.0
     while not stop_event.is_set():
         try:
             msg = mav.recv_match(blocking=False)
             if not msg or msg.get_type() == "BAD_DATA":
+                if (not param_sync_done) and (time.time() - last_param_time[0] > param_timeout):
+                    logging.info("[PARAM] Timeout param, dianggap selesai")
+                    param_sync_done = True
                 continue
 
             check_link_quality(msg)
@@ -83,6 +85,9 @@ def mav_to_udp_loop(mav, stop_event, udp_out, last_param_time, first_data_time, 
                     logging.info("Kirim PARAM_REQUEST_LIST ke MAV...")
 
             if msg.get_type() == "PARAM_VALUE":
+                if param_sync_done:
+                    logging.debug(f"[PARAM] Extra param setelah sync: {msg.param_id}")
+                    continue
                 last_param_time[0] = time.time()
                 if total_param is None:
                     total_param = msg.param_count
@@ -138,6 +143,7 @@ def param_monitor(stop_event, last_param_time):
     while not stop_event.is_set():
         if time.time() - last_param_time[0] > PARAM_TIMEOUT:
             logging.info("[PARAM] Timeout param, dianggap selesai")
+            param_sync_done = True
             break
         time.sleep(1)
 
