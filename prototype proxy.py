@@ -10,23 +10,20 @@ from datetime import datetime
 import serial.tools.list_ports
 import queue
 
-TELEMETRY_PORT = 'COM3' #liat di device manager untuk tau com nya
-BAUD = 57600 # umumnya itu
+TELEMETRY_PORT = 'COM3'
+BAUD = 57600
 UDP_PORT_MAV = 1802
-UDP_PORT_MP  = 1805 # nanti masukkan ke MP itu kalo mau di tes
-LINK_QUALITY_PORT = 19000 # nanti sesuaikan dengan program failover
+UDP_PORT_MP = 1805
+LINK_QUALITY_PORT = 19000
 TIMEOUT = 5
 QUEUE_MAX = 8192
+PARAM_TIMEOUT = 30
+PER_PARAM_TIMEOUT = 1.0
+
 param_queue = queue.Queue(maxsize=QUEUE_MAX)
 buffer = {}
-param_rate = 0.5
 expected_index = 0
 total_param = None
-PARAM_TIMEOUT = 30
-last_seen_time = time.time()
-param_sync_done = False
-
-
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -36,17 +33,6 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-
-# beep biar tau com kebaca atau ga
-def beep():
-    try:
-        if platform.system() == "Windows":
-            import winsound
-            winsound.Beep(1000, 300)
-        else:
-            print('\a')
-    except:
-        logging.warning("Tidak bisa memutar beep")
 
 last_seq = None
 recv_count = 0
@@ -74,7 +60,6 @@ def get_quality():
             return 0.0, recv_count, lost_count
         return (recv_count / total) * 100.0, recv_count, lost_count
 
-
 def mav_to_udp_loop(mav, stop_event, udp_out, last_param_time):
     global buffer, expected_index, total_param, last_seen_time, param_sync_done
     param_timeout = 5.0
@@ -88,6 +73,17 @@ def mav_to_udp_loop(mav, stop_event, udp_out, last_param_time):
                 continue
 
             check_link_quality(msg)
+
+            if msg.get_type() != "PARAM_VALUE" and first_data_time[0] is None:
+                first_data_time[0] = time.time()
+                logging.info(f"[INFO] Data non-param pertama diterima: {msg.get_type()}")
+
+            if first_data_time[0] and not param_requested[0]:
+                if time.time() - first_data_time[0] >= 10:
+                    mav.mav.param_request_list_send(mav.target_system, mav.target_component)
+                    param_requested[0] = True
+                    logging.info("Kirim PARAM_REQUEST_LIST ke MAV...")
+
             if msg.get_type() == "PARAM_VALUE":
                 if param_sync_done:
                     logging.debug(f"[PARAM] Extra param setelah sync: {msg.param_id}")
@@ -96,39 +92,29 @@ def mav_to_udp_loop(mav, stop_event, udp_out, last_param_time):
                 if total_param is None:
                     total_param = msg.param_count
                     logging.info(f"[PARAM] Total param: {total_param}")
+
                 idx = msg.param_index
-                
-                if idx < 0 or idx >= 65535:
-                    if total_param and expected_index >= total_param:
-                        logging.debug(f"[PARAM] Index invalid {idx} ({msg.param_id}) diabaikan karena param sudah selesai")
-                        continue
-                    else:
-                        logging.debug(f"[PARAM] Index invalid {idx}, tetap forward: {msg.param_id}")
-                        udp_out.sendto(msg.get_msgbuf(), ('127.0.0.1', UDP_PORT_MP))
-                    continue
-                buffer[idx] = msg
-                while expected_index in buffer:
-                    m = buffer.pop(expected_index)
-                    logging.info(f"[PARAM] {m.param_index}/{total_param-1} {m.param_id} = {m.param_value}")
-                    udp_out.sendto(m.get_msgbuf(), ('127.0.0.1', UDP_PORT_MP))
-                    expected_index += 1
-                    last_seen_time = time.time()
-                
-                if (time.time() - last_seen_time) > 2.0 and buffer:
-                    next_idx = min(buffer.keys())
-                    m = buffer.pop(next_idx)
-                    logging.warning(f"[PARAM] Timeout index {expected_index}, lepas {m.param_index} {m.param_id}")
-                    udp_out.sendto(m.get_msgbuf(), ('127.0.0.1', UDP_PORT_MP))
-                    expected_index = next_idx + 1
-                    last_seen_time = time.time()
-
-
-                if total_param is not None and expected_index >= total_param:
-                    logging.info("[PARAM] Semua parameter sudah diteruskan ke MP")
-                    param_sync_done = True
-                    continue
+                with lock:
+                    buffer[idx] = msg
+                    param_timeouts[idx] = time.time()
+                    while expected_index in buffer:
+                        m = buffer.pop(expected_index)
+                        param_timeouts.pop(expected_index, None)
+                        logging.info(f"[PARAM] {m.param_index}/{total_param-1} {m.param_id} = {m.param_value}")
+                        udp_out.sendto(m.get_msgbuf(), ('127.0.0.1', UDP_PORT_MP))
+                        expected_index += 1
             else:
                 udp_out.sendto(msg.get_msgbuf(), ('127.0.0.1', UDP_PORT_MP))
+
+            with lock:
+                to_remove = []
+                for idx, t in param_timeouts.items():
+                    if time.time() - t > PER_PARAM_TIMEOUT and idx == expected_index:
+                        logging.warning(f"[PARAM] Parameter index {idx} tidak diterima, lewati.")
+                        to_remove.append(idx)
+                        expected_index += 1
+                for idx in to_remove:
+                    param_timeouts.pop(idx, None)
 
             time.sleep(0.001)
 
@@ -201,8 +187,7 @@ def main():
 
             logging.info(f"Mencoba koneksi ke {TELEMETRY_PORT}...")
             mav = mavutil.mavlink_connection(TELEMETRY_PORT, baud=BAUD)
-            
-            # Cek heartbeat
+
             start_time = time.time()
             heartbeat_received = False
             while time.time() - start_time < TIMEOUT:
@@ -215,13 +200,14 @@ def main():
             if not heartbeat_received:
                 logging.error("Tidak ada heartbeat, keluar")
                 return
-            logging.info("Heartbeat diterima, kirim PARAM_REQUEST_LIST")
-            mav.mav.param_request_list_send(mav.target_system, mav.target_component)
+            logging.info("Heartbeat diterima.")
 
             last_param_time = [time.time()]
+            first_data_time = [None]
+            param_requested = [False]
+
             threads = [
-                threading.Thread(target=mav_to_udp_loop, args=(mav, stop_event, udp_out, last_param_time), daemon=True),
-                # threading.Thread(target=param_forwarder, args=(stop_event, udp_out), daemon=True),
+                threading.Thread(target=mav_to_udp_loop, args=(mav, stop_event, udp_out, last_param_time, first_data_time, param_requested), daemon=True),
                 threading.Thread(target=udp_to_mav_loop, args=(mav, stop_event, udp_in), daemon=True),
                 threading.Thread(target=param_monitor, args=(stop_event, last_param_time), daemon=True),
                 threading.Thread(target=link_quality_monitor, args=(stop_event,), daemon=True),
@@ -233,25 +219,19 @@ def main():
                 t.start()
 
             while not stop_event.is_set():
-                if total_param and time.time() - last_param_time[0] > 30:
+                if total_param and time.time() - last_param_time[0] > PARAM_TIMEOUT:
                     logging.info("[PARAM] Timeout tercapai, hentikan request param.")
                     break
                 time.sleep(1)
+
         except KeyboardInterrupt:
             stop_event.set()
-                # if not any(t.is_alive() for t in threads[:4]):
-                #     logging.error("Thread utama mati, restart...")
-                #     stop_event.set()
-                #     break
-                # time.sleep(1)
-
             try:
                 mav.close()
                 udp_in.close()
                 udp_out.close()
             except:
                 pass
-
             logging.info("Restart dalam 3 detik...")
             time.sleep(3)
 
