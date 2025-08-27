@@ -7,43 +7,32 @@ import csv
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
 import serial.tools.list_ports
-import queue
 
-# ===== CONFIG =====
+# --- Konfigurasi ---
 TELEMETRY_PORT = 'COM3'
 BAUD = 57600
-UDP_PORT_MAV = 14550
-UDP_PORT_MP  = 1802
+UDP_PORT_MAV = 14550   # port untuk MAVLink input dari Mission Planner
+UDP_PORT_MP  = 14560   # port forward ke Mission Planner
 LINK_QUALITY_PORT = 19000
-TIMEOUT = 10
-QUEUE_MAX = 8192
-PARAM_TIMEOUT = 30
-PER_PARAM_TIMEOUT = 1.0
-COMMAND_RETRY_INTERVAL = 1.0  # detik
+TIMEOUT = 5
 
-# ===== GLOBAL =====
-param_queue = queue.Queue(maxsize=QUEUE_MAX)
-buffer = {}
-expected_index = 0
-total_param = None
-last_seq = None
-recv_count = 0
-lost_count = 0
-lock = threading.Lock()
-command_queue = queue.Queue()  # queue untuk retry command
-
-# ===== LOGGING =====
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
-        RotatingFileHandler("proxy.log", maxBytes=1_000_000, backupCount=3),
+        RotatingFileHandler("hybrid.log", maxBytes=1_000_000, backupCount=3),
         logging.StreamHandler()
     ]
 )
 
-# ===== LINK QUALITY =====
+# --- Variabel kualitas link ---
+last_seq = None
+recv_count = 0
+lost_count = 0
+lock = threading.Lock()
+
 def check_link_quality(msg):
+    """Hitung paket hilang berdasar sequence number MAVLink"""
     global last_seq, recv_count, lost_count
     try:
         seq = msg.get_seq()
@@ -58,113 +47,56 @@ def check_link_quality(msg):
         recv_count += 1
 
 def get_quality():
+    """Return (persen, recv, lost)"""
     with lock:
         total = recv_count + lost_count
         if total == 0:
             return 0.0, recv_count, lost_count
         return (recv_count / total) * 100.0, recv_count, lost_count
 
-# ===== MAV TO UDP =====
-def mav_to_udp_loop(mav, stop_event, udp_out, last_param_time, first_data_time, param_requested):
-    global buffer, expected_index, total_param
-    param_timeouts = {}
-
+# --- Loop utama MAV->UDP ---
+def mav_to_udp_loop(mav, stop_event, udp_out):
     while not stop_event.is_set():
         try:
             msg = mav.recv_match(blocking=False)
             if not msg or msg.get_type() == "BAD_DATA":
                 continue
 
+            # hitung kualitas link
             check_link_quality(msg)
 
-            if msg.get_type() != "PARAM_VALUE" and first_data_time[0] is None:
-                first_data_time[0] = time.time()
-                logging.info(f"[INFO] Data non-param pertama diterima: {msg.get_type()}")
-
-            if first_data_time[0] and not param_requested[0]:
-                if time.time() - first_data_time[0] >= 10:
-                    mav.mav.param_request_list_send(mav.target_system, mav.target_component)
-                    param_requested[0] = True
-                    logging.info("Kirim PARAM_REQUEST_LIST ke MAV...")
-
-            if msg.get_type() == "PARAM_VALUE":
-                last_param_time[0] = time.time()
-                if total_param is None:
-                    total_param = msg.param_count
-                    logging.info(f"[PARAM] Total param: {total_param}")
-
-                idx = msg.param_index
-                with lock:
-                    buffer[idx] = msg
-                    param_timeouts[idx] = time.time()
-                    while expected_index in buffer:
-                        m = buffer.pop(expected_index)
-                        param_timeouts.pop(expected_index, None)
-                        logging.info(f"[PARAM] {m.param_index}/{total_param-1} {m.param_id} = {m.param_value}")
-                        udp_out.sendto(m.get_msgbuf(), ("127.0.0.1", UDP_PORT_MP))
-                        expected_index += 1
-
-            else:
-                udp_out.sendto(msg.get_msgbuf(), ("127.0.0.1", UDP_PORT_MP))
-
-            # Timeout & skip parameter
-            with lock:
-                while expected_index in param_timeouts and time.time() - param_timeouts[expected_index] > PER_PARAM_TIMEOUT:
-                    logging.warning(f"[PARAM] Parameter index {expected_index} tidak diterima, lewati.")
-                    param_timeouts.pop(expected_index, None)
-                    expected_index += 1
-
-            time.sleep(0.001)
-
+            # forward raw MAVLink ke Mission Planner
+            udp_out.sendto(msg.get_msgbuf(), ('127.0.0.1', UDP_PORT_MP))
         except Exception as e:
             logging.error(f"mav_to_udp_loop error: {e}")
             stop_event.set()
             break
-
+        time.sleep(0.001)
     logging.info("mav_to_udp_loop selesai.")
 
-# ===== UDP TO MAV (dengan command retry & ACK) =====
+# --- Loop utama UDP->MAV ---
 def udp_to_mav_loop(mav, stop_event, udp_in):
     udp_in.settimeout(1.0)
     while not stop_event.is_set():
         try:
             data, _ = udp_in.recvfrom(4096)
             mav.write(data)
-            command_queue.put((data, time.time()))
         except socket.timeout:
-            # retry command jika belum ACK
-            now = time.time()
-            temp_queue = queue.Queue()
-            while not command_queue.empty():
-                cmd, tstamp = command_queue.get()
-                if now - tstamp >= COMMAND_RETRY_INTERVAL:
-                    mav.write(cmd)
-                    temp_queue.put((cmd, now))
-                else:
-                    temp_queue.put((cmd, tstamp))
-            command_queue.queue = temp_queue.queue
+            continue
         except Exception as e:
             logging.error(f"udp_to_mav_loop error: {e}")
             stop_event.set()
             break
     logging.info("udp_to_mav_loop selesai.")
 
-# ===== PARAM MONITOR =====
-def param_monitor(stop_event, last_param_time):
-    while not stop_event.is_set():
-        if time.time() - last_param_time[0] > PARAM_TIMEOUT:
-            logging.info("[PARAM] Timeout param, dianggap selesai")
-            break
-        time.sleep(1)
-
-# ===== LINK QUALITY MONITOR =====
+# --- Monitor kualitas link ---
 def link_quality_monitor(stop_event):
     while not stop_event.is_set():
-        time.sleep(5)
         q, r, l = get_quality()
         logging.info(f"[LINK] Quality: {q:.2f}% (recv={r}, lost={l})")
+        time.sleep(5)
 
-# ===== UDP QUALITY BROADCAST =====
+# --- Broadcast kualitas via UDP ---
 def udp_quality_broadcast(stop_event):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     while not stop_event.is_set():
@@ -173,18 +105,17 @@ def udp_quality_broadcast(stop_event):
         sock.sendto(msg.encode(), ('127.0.0.1', LINK_QUALITY_PORT))
         time.sleep(1)
 
-# ===== LOG CSV =====
+# --- Logging kualitas ke CSV ---
 def log_quality_csv(stop_event, file_path="link_quality.csv"):
     with open(file_path, "w", newline="") as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow(["timestamp", "quality_percent", "recv", "lost"])
         while not stop_event.is_set():
             q, r, l = get_quality()
-            writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), round(q,3), r, l])
+            writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), round(q, 3), r, l])
             csvfile.flush()
             time.sleep(0.5)
 
-# ===== MAIN =====
 def main():
     ports = list(serial.tools.list_ports.comports())
     print("Port serial yang terdeteksi:")
@@ -202,56 +133,23 @@ def main():
             logging.info(f"Mencoba koneksi ke {TELEMETRY_PORT}...")
             mav = mavutil.mavlink_connection(TELEMETRY_PORT, baud=BAUD)
 
-            # Reset state
-            global buffer, expected_index, total_param, last_seq, recv_count, lost_count
-            buffer.clear()
-            expected_index = 0
-            total_param = None
-            last_seq = None
-            recv_count = 0
-            lost_count = 0
-
-            # Heartbeat
-            start_time = time.time()
-            heartbeat_received = False
-            while time.time() - start_time < TIMEOUT:
-                msg = mav.recv_match(type='HEARTBEAT', blocking=False)
-                if msg:
-                    heartbeat_received = True
-                    try:
-                        mav.target_system = msg.get_srcSystem()
-                        mav.target_component = msg.get_srcComponent()
-                    except AttributeError:
-                        mav.target_system = getattr(msg, 'sysid', 1)
-                        mav.target_component = getattr(msg, 'compid', 1)
-                    # break
-                time.sleep(0.01)
-
-            if not heartbeat_received:
+            if not mav.wait_heartbeat(timeout=TIMEOUT):
                 logging.error("Tidak ada heartbeat, keluar")
                 return
-            logging.info(f"Heartbeat diterima: sysid={mav.target_system}, compid={mav.target_component}")
-
-            last_param_time = [time.time()]
-            first_data_time = [None]
-            param_requested = [False]
+            logging.info("Heartbeat diterima.")
 
             threads = [
-                threading.Thread(target=mav_to_udp_loop, args=(mav, stop_event, udp_out, last_param_time, first_data_time, param_requested), daemon=True),
+                threading.Thread(target=mav_to_udp_loop, args=(mav, stop_event, udp_out), daemon=True),
                 threading.Thread(target=udp_to_mav_loop, args=(mav, stop_event, udp_in), daemon=True),
-                threading.Thread(target=param_monitor, args=(stop_event, last_param_time), daemon=True),
                 threading.Thread(target=link_quality_monitor, args=(stop_event,), daemon=True),
                 threading.Thread(target=log_quality_csv, args=(stop_event,), daemon=True),
-                threading.Thread(target=udp_quality_broadcast, args=(stop_event,), daemon=True)
+                threading.Thread(target=udp_quality_broadcast, args=(stop_event,), daemon=True),
             ]
 
             for t in threads:
                 t.start()
 
             while not stop_event.is_set():
-                if total_param and time.time() - last_param_time[0] > PARAM_TIMEOUT:
-                    logging.info("[PARAM] Timeout tercapai, hentikan request param.")
-                    break
                 time.sleep(1)
 
         except KeyboardInterrupt:
@@ -262,8 +160,8 @@ def main():
                 udp_out.close()
             except:
                 pass
-            logging.info("Restart dalam 3 detik...")
-            time.sleep(3)
+            logging.info("Keluar program...")
+            break
 
         except Exception as e:
             logging.error(f"Error utama: {e}")
