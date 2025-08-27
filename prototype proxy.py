@@ -12,7 +12,6 @@ import queue
 
 TELEMETRY_PORT = 'COM3'
 BAUD = 57600
-UDP_PORT_MAV = 1802
 UDP_PORT_MP = 1805
 LINK_QUALITY_PORT = 19000
 TIMEOUT = 5
@@ -24,6 +23,7 @@ param_queue = queue.Queue(maxsize=QUEUE_MAX)
 buffer = {}
 expected_index = 0
 total_param = None
+client_addr = None
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -38,6 +38,16 @@ last_seq = None
 recv_count = 0
 lost_count = 0
 lock = threading.Lock()
+
+def beep():
+    try:
+        if platform.system() == "Windows":
+            import winsound
+            winsound.Beep(1000, 300)
+        else:
+            print('\a')
+    except:
+        logging.warning("Tidak bisa memutar beep")
 
 def check_link_quality(msg):
     global last_seq, recv_count, lost_count
@@ -61,7 +71,7 @@ def get_quality():
         return (recv_count / total) * 100.0, recv_count, lost_count
 
 def mav_to_udp_loop(mav, stop_event, udp_out, last_param_time, first_data_time, param_requested):
-    global buffer, expected_index, total_param
+    global buffer, expected_index, total_param, client_addr
     param_timeouts = {}
 
     while not stop_event.is_set():
@@ -96,10 +106,10 @@ def mav_to_udp_loop(mav, stop_event, udp_out, last_param_time, first_data_time, 
                         m = buffer.pop(expected_index)
                         param_timeouts.pop(expected_index, None)
                         logging.info(f"[PARAM] {m.param_index}/{total_param-1} {m.param_id} = {m.param_value}")
-                        udp_out.sendto(m.get_msgbuf(), ('127.0.0.1', UDP_PORT_MP))
+                        udp_out.sendto(m.get_msgbuf(), client_addr)
                         expected_index += 1
             else:
-                udp_out.sendto(msg.get_msgbuf(), ('127.0.0.1', UDP_PORT_MP))
+                udp_out.sendto(msg.get_msgbuf(), client_addr)
 
             with lock:
                 to_remove = []
@@ -121,10 +131,12 @@ def mav_to_udp_loop(mav, stop_event, udp_out, last_param_time, first_data_time, 
     logging.info("mav_to_udp_loop selesai.")
 
 def udp_to_mav_loop(mav, stop_event, udp_in):
+    global client_addr
     udp_in.settimeout(1.0)
     while not stop_event.is_set():
         try:
-            data, _ = udp_in.recvfrom(4096)
+            data, addr = udp_in.recvfrom(4096)
+            client_addr = addr
             mav.write(data)
         except socket.timeout:
             continue
@@ -177,7 +189,7 @@ def main():
             udp_out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             udp_in  = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             udp_in.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            udp_in.bind(('0.0.0.0', UDP_PORT_MAV))
+            udp_in.bind(('0.0.0.0', UDP_PORT_MP))
 
             logging.info(f"Mencoba koneksi ke {TELEMETRY_PORT}...")
             mav = mavutil.mavlink_connection(TELEMETRY_PORT, baud=BAUD)
@@ -195,6 +207,7 @@ def main():
                 logging.error("Tidak ada heartbeat, keluar")
                 return
             logging.info("Heartbeat diterima.")
+            beep()
 
             last_param_time = [time.time()]
             first_data_time = [None]
