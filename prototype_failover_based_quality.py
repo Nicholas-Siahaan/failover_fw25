@@ -119,7 +119,7 @@ def failover_manager(global_stop_event, quality_container):
         if quality >= 60:
             if high_quality_start is None:
                 high_quality_start = now
-            if now - high_quality_start >= 3:   
+            if now - high_quality_start >= 0:   
                 target_source = ('127.0.0.1', PROXY_UDP_PORT)
             low_quality_start = None
         elif quality < 30:

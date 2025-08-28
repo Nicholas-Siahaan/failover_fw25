@@ -12,11 +12,17 @@ import psutil
 # --- Konfigurasi ---
 TELEMETRY_PORT = 'COM3'
 BAUD = 57600
-MP_INPUT_PORT  = 1802
-MP_OUTPUT_PORT = 1805    # port forward ke Mission Planner
+MP_INPUT_PORT  = 1805
+MP_OUTPUT_PORT = 1802    # port forward ke Mission Planner
 LINK_QUALITY_PORT = 19000
 TIMEOUT = 5
 SEQ_LOG_INTERVAL = 50 
+last_msg_time = time.time()
+timeout_duration = 10
+recv_count = 0
+lost_count = 0
+last_seq = None
+lock = threading.Lock()
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -53,7 +59,7 @@ def get_quality():
         total = recv_count + lost_count
         if total == 0:
             return 0.0, recv_count, lost_count
-        return (recv_count / total) * 100.0, recv_count, lost_count
+        return (recv_count / total) * 10000.0, recv_count, lost_count
 
 # --- Monitor kualitas link ---
 def link_quality_monitor(stop_event):
@@ -101,12 +107,7 @@ def wait_for_mission_planner(port, timeout=10):
     return False
 
 def mav_to_gcs_loop(mav, stop_event, gcs_socket):
-    last_seq = None
-    recv = 0
-    lost = 0
-    last_msg_time = time.time()
-    timeout_duration = 10
-    no_msg_count = 0
+    global last_seq, recv_count, lost_count
     while not stop_event.is_set():
         try:
             has_msg = False
@@ -115,22 +116,23 @@ def mav_to_gcs_loop(mav, stop_event, gcs_socket):
                 if msg is None:
                     break
                 if msg.get_type() != "BAD_DATA":
+                    try:
                       # --- Hitung kualitas link pakai SEQ (telemetry) ---
-                    seq = msg.get_seq()
-                    if last_seq is not None:
-                        diff = (seq - last_seq) % 256
-                        if diff > 1:
-                            lost += diff - 1
-                    last_seq = seq
-                    recv += 1
+                        seq = msg.get_seq()
+                        with lock:
+                            if last_seq is not None:
+                                expected = (seq - last_seq) % 256
+                                if seq != expected:
+                                    lost_count += (seq - expected) % 256
+                            last_seq = seq
+                            recv_count += 1
 
-                    total = recv + lost
-                    quality_seq = 100.0 * recv / total if total > 0 else 0.0
-
-                    if recv % SEQ_LOG_INTERVAL == 0:
-                        logging.info(f"[SEQ] Quality: {quality_seq:.2f}% (recv={recv}, lost={lost})")
-
-                    gcs_socket.sendto(msg.get_msgbuf(), ('127.0.0.1', MP_INPUT_PORT))
+                        gcs_socket.sendto(msg.get_msgbuf(), ('127.0.0.1', MP_INPUT_PORT))
+                    except Exception as e:
+                        logging.error("Serial device dicabut, hentikan mav_to_gcs_loop")
+                        stop_event.set()
+                        gcs_socket.close()
+                        break
 
                 # --- Hitung kualitas link pakai RADIO_STATUS (versi Mission Planner) ---
                 # if msg.get_type() == "RADIO_STATUS":
@@ -170,7 +172,11 @@ def gcs_to_mav_loop(mav, stop_event, link_type, gcs_socket):
         try:
             data, _ = gcs_socket.recvfrom(1024)
             mav.write(data)
-
+        except serial.SerialException as e:
+            logging.error(f"Serial error: {e}")
+            stop_event.set()
+            gcs_socket.close()
+            break
         except socket.timeout:
             # Tidak ada data masuk dari Mission Planner selama 3 detik
             time.sleep(0.01)
@@ -250,65 +256,66 @@ def auto_connect(gcs_socket):
         time.sleep(5)
 
 if __name__ == "__main__":
-    ports = list(serial.tools.list_ports.comports())
-    print("Daftar port serial yang terdeteksi:")
-    for port in ports:
-        print(f"- {port.device} : {port.description}")
+    try:
+        ports = list(serial.tools.list_ports.comports())
+        print("Daftar port serial yang terdeteksi:")
+        for port in ports:
+            print(f"- {port.device} : {port.description}")
 
-    while is_port_in_use(MP_OUTPUT_PORT):
-        logging.warning(f"Port {MP_OUTPUT_PORT} masih digunakan! Menunggu...")
-        time.sleep(3)
+        while is_port_in_use(MP_OUTPUT_PORT):
+            logging.warning(f"Port {MP_OUTPUT_PORT} masih digunakan! Menunggu...")
+            time.sleep(3)
 
 
-    while True:
-        stop_event = threading.Event()
-        restart_event = threading.Event()
-        gcs_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        gcs_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            gcs_socket.bind(('127.0.0.1', MP_OUTPUT_PORT))
-        except Exception as e:
-            logging.error(f"Gagal bind port {MP_OUTPUT_PORT}: {e}")
+        while True:
+            stop_event = threading.Event()
+            restart_event = threading.Event()
+            gcs_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            gcs_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                gcs_socket.bind(('127.0.0.1', MP_OUTPUT_PORT))
+            except Exception as e:
+                logging.error(f"Gagal bind port {MP_OUTPUT_PORT}: {e}")
+                stop_event.set()
+                continue
+            mav, link_type = auto_connect(gcs_socket)
+            logging.info(f"Koneksi aktif: {link_type}")
+            t1 = threading.Thread(target=mav_to_gcs_loop, args=(mav, stop_event, gcs_socket), name="MavToGCS")
+            wait_for_mission_planner(MP_INPUT_PORT)
+            t2 = threading.Thread(target=gcs_to_mav_loop, args=(mav, stop_event, link_type, gcs_socket), name="GCSToMav")
+            hb = threading.Thread(target=monitor_heartbeat, args=(mav, stop_event, restart_event, link_type), name="HeartbeatMonitor")
+            t3 = threading.Thread(target=link_quality_monitor, args=(stop_event,), daemon=True)
+            t4 = threading.Thread(target=log_quality_csv, args=(stop_event,), daemon=True)
+            t5 = threading.Thread(target=udp_quality_broadcast, args=(stop_event,), daemon=True)
+            t1.start()
+            t2.start()
+            hb.start()
+            t3.start()
+            t4.start()
+            t5.start()
+            while not restart_event.is_set():
+                if not t1.is_alive() or not t2.is_alive():
+                    logging.error("Salah satu thread GCS mati, keluar...")
+                    restart_event.set()
+                time.sleep(0.5)
             stop_event.set()
-            continue
-        mav, link_type = auto_connect(gcs_socket)
-        logging.info(f"Koneksi aktif: {link_type}")
-        t1 = threading.Thread(target=mav_to_gcs_loop, args=(mav, stop_event, gcs_socket), name="MavToGCS")
-        wait_for_mission_planner(MP_INPUT_PORT)
-        t2 = threading.Thread(target=gcs_to_mav_loop, args=(mav, stop_event, link_type, gcs_socket), name="GCSToMav")
-        hb = threading.Thread(target=monitor_heartbeat, args=(mav, stop_event, restart_event, link_type), name="HeartbeatMonitor")
-        t3 = threading.Thread(target=link_quality_monitor, args=(stop_event,), daemon=True)
-        t4 = threading.Thread(target=log_quality_csv, args=(stop_event,), daemon=True)
-        t5 = threading.Thread(target=udp_quality_broadcast, args=(stop_event,), daemon=True)
-        t1.start()
-        t2.start()
-        hb.start()
-        t3.start()
-        t4.start()
-        t5.start()
-        while not restart_event.is_set():
-            if not t1.is_alive() or not t2.is_alive():
-                logging.error("Salah satu thread GCS mati, keluar...")
-                restart_event.set()
-            time.sleep(0.5)
+            try:
+                mav.close()
+            except:
+                logging.warning("Gagal menutup koneksi MAV")
+                logging.info("gcs_socket berhasil ditutup")
+            t1.join()
+            t2.join()
+            hb.join()
+            t3.join()
+            t4.join()
+            t5.join()
+            time.sleep(1)
+            logging.info("Restarting connection dalam 1 detik...\n")
+            time.sleep(1)
+
+    except KeyboardInterrupt:
+        logging.info("KeyboardInterrupt diterima, menghentikan program...")
         stop_event.set()
-        try:
-            mav.close()
-        except:
-            logging.warning("Gagal menutup koneksi MAV")
-            logging.info("gcs_socket berhasil ditutup")
-        # try:
-        #     gcs_socket.close()
-        # except:
-        #     logging.warning("Gagal menutup gcs_socket")
-        #     time.sleep(1)
-        #     pass
-        t1.join()
-        t2.join()
-        hb.join()
-        t3.join()
-        t4.join()
-        t5.join()
-        time.sleep(1)
-        logging.info("Restarting connection dalam 1 detik...\n")
-        time.sleep(1)
+        gcs_socket.close()
+        time.sleep(0.5)
