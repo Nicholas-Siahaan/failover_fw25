@@ -8,6 +8,7 @@ from logging.handlers import RotatingFileHandler
 from datetime import datetime
 import serial.tools.list_ports
 import psutil
+from collections import deque
 
 # --- Konfigurasi ---
 TELEMETRY_PORT = 'COM3'
@@ -23,6 +24,10 @@ recv_count = 0
 lost_count = 0
 last_seq = None
 lock = threading.Lock()
+link_window = deque()
+QUALITY_WINDOW = 3
+UPDATE_INTERVAL = 1 
+
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -32,47 +37,46 @@ logging.basicConfig(
     ]
 )
 
-# --- Variabel kualitas link ---
-last_seq = None
-recv_count = 0
-lost_count = 0
-lock = threading.Lock()
 
-def check_link_quality(msg):
-    """Hitung paket hilang berdasar sequence number MAVLink"""
-    global last_seq, recv_count, lost_count
-    try:
-        seq = msg.get_seq()
-    except:
-        return
+def update_link_window(seq):
+    global link_window, last_seq
     with lock:
+        now = time.time()
+        # hapus paket lebih lama dari QUALITY_WINDOW
+        while link_window and now - link_window[0][0] > QUALITY_WINDOW:
+            link_window.popleft()
+
         if last_seq is not None:
             expected = (last_seq + 1) % 256
-            if seq != expected:
-                lost_count += (seq - expected) % 256
+            lost = (seq - expected) % 256
+            # masukkan paket hilang
+            for _ in range(lost):
+                link_window.append((now, 0))
+        # masukkan paket diterima
+        link_window.append((now, 1))
         last_seq = seq
-        recv_count += 1
 
-def get_quality():
-    """Return (persen, recv, lost)"""
+def get_link_quality():
     with lock:
-        total = recv_count + lost_count
-        if total == 0:
-            return 0.0, recv_count, lost_count
-        return (recv_count / total) * 10000.0, recv_count, lost_count
+        if not link_window:
+            return 0.0, 0, 0
+        recv = sum(1 for _, s in link_window if s == 1)
+        lost = sum(1 for _, s in link_window if s == 0)
+        total = recv + lost
+        quality = (recv / total) * 100 if total > 0 else 0.0
+        return quality, recv, lost
 
-# --- Monitor kualitas link ---
 def link_quality_monitor(stop_event):
     while not stop_event.is_set():
-        q, r, l = get_quality()
+        q, r, l = get_link_quality()
         logging.info(f"[LINK] Quality: {q:.2f}% (recv={r}, lost={l})")
-        time.sleep(5)
+        time.sleep(UPDATE_INTERVAL)
 
 # --- Broadcast kualitas via UDP ---
 def udp_quality_broadcast(stop_event):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     while not stop_event.is_set():
-        q, r, l = get_quality()
+        q, r, l = get_link_quality()
         msg = f"{q:.2f},{r},{l}"
         sock.sendto(msg.encode(), ('127.0.0.1', LINK_QUALITY_PORT))
         time.sleep(1)
@@ -83,7 +87,7 @@ def log_quality_csv(stop_event, file_path="link_quality.csv"):
         writer = csv.writer(csvfile)
         writer.writerow(["timestamp", "quality_percent", "recv", "lost"])
         while not stop_event.is_set():
-            q, r, l = get_quality()
+            q, r, l = get_link_quality()
             writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), round(q, 3), r, l])
             csvfile.flush()
             time.sleep(0.5)
@@ -107,7 +111,7 @@ def wait_for_mission_planner(port, timeout=10):
     return False
 
 def mav_to_gcs_loop(mav, stop_event, gcs_socket):
-    global last_seq, recv_count, lost_count
+    global last_seq, recv_count, lost_count, last_msg_time
     while not stop_event.is_set():
         try:
             has_msg = False
@@ -120,12 +124,7 @@ def mav_to_gcs_loop(mav, stop_event, gcs_socket):
                       # --- Hitung kualitas link pakai SEQ (telemetry) ---
                         seq = msg.get_seq()
                         with lock:
-                            if last_seq is not None:
-                                expected = (seq - last_seq) % 256
-                                if seq != expected:
-                                    lost_count += (seq - expected) % 256
-                            last_seq = seq
-                            recv_count += 1
+                            update_link_window(seq)
 
                         gcs_socket.sendto(msg.get_msgbuf(), ('127.0.0.1', MP_INPUT_PORT))
                     except Exception as e:
@@ -133,19 +132,7 @@ def mav_to_gcs_loop(mav, stop_event, gcs_socket):
                         stop_event.set()
                         gcs_socket.close()
                         break
-
-                # --- Hitung kualitas link pakai RADIO_STATUS (versi Mission Planner) ---
-                # if msg.get_type() == "RADIO_STATUS":
-                #     rxerrors = msg.rxerrors
-                #     fixed = msg.fixed
-
-                #     total = rxerrors + fixed
-                #     quality_radio = 100.0 * (1 - (rxerrors / total)) if total > 0 else 100.0
-
-                #     logging.info(f"[RADIO] Quality: {quality_radio:.2f}% (rxerr={rxerrors}, fixed={fixed})")
-
                     has_msg = True
-                    # logging.debug(f"MAVLink message: {msg.get_type()}")
             if has_msg:
                 last_msg_time = time.time()
             elif time.time() - last_msg_time > timeout_duration:
