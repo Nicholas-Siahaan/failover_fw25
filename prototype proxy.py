@@ -9,6 +9,7 @@ from datetime import datetime
 import serial.tools.list_ports
 import psutil
 from collections import deque
+import logging
 
 
 TELEMETRY_PORT   = 'COM6'
@@ -21,7 +22,12 @@ TIMEOUT          = 5
 SEQ_LOG_INTERVAL = 50
 timeout_duration = 10
 window = deque()
+radio_window = deque(maxlen=10)
 
+_last_rxerrors = None
+_last_fixed = None
+
+last_radio = None
 last_msg_time = time.time()
 last_seq      = None
 lock = threading.Lock()
@@ -76,13 +82,71 @@ def get_quality():
             return 0.0, recv, lost
         return (recv / total) * 100.0, recv, lost
 
+def calc_radio_quality(rssi, remrssi, rxerrors, fixed):
+    global _last_rxerrors, _last_fixed
 
+    # Normalisasi RSSI (Mission Planner tipikal: 173–174 sudah 100%)
+    def norm(val):
+        return min(100.0, (val / 173.0) * 100.0)
+
+    local_quality = norm(rssi)
+    remote_quality = norm(remrssi)
+
+    # delta error
+    if _last_rxerrors is not None and _last_fixed is not None:
+        delta_err = max(0, rxerrors - _last_rxerrors)
+        delta_fix = max(0, fixed - _last_fixed)
+        total = delta_err + delta_fix
+        if total > 0:
+            error_quality = max(0.0, 100.0 - (delta_err / total) * 100.0)
+        else:
+            error_quality = 100.0
+    else:
+        error_quality = 100.0
+
+    _last_rxerrors, _last_fixed = rxerrors, fixed
+
+    # Ambil min, tapi kalau error_quality = 100 (tidak ada update error), 
+    # pakai rata-rata local/remote
+    if error_quality == 100.0:
+        return round((local_quality + remote_quality) / 2.0, 2)
+    else:
+        return round(min(local_quality, remote_quality, error_quality), 2)
+
+def handle_radio_status(msg):
+    rssi = msg.rssi
+    remrssi = msg.remrssi
+    rxerrors = msg.rxerrors
+    fixed = msg.fixed
+
+    logging.debug(f"RADIO_STATUS raw: fixed={fixed} rxerrors={rxerrors} "
+                  f"rssi={rssi} remrssi={remrssi}")
+
+    quality = calc_radio_quality(rssi, remrssi, rxerrors, fixed)
+    logging.info(f"[RADIO] Quality: {quality:.2f}%")
+
+def get_quality_radio():
+    """Hitung rata-rata kualitas dari RADIO_STATUS"""
+    with lock:
+        if not radio_window:
+            return None
+        fixed_sum = sum(f for f, _ in radio_window)
+        error_sum = sum(e for _, e in radio_window)
+        total = fixed_sum + error_sum
+        if total == 0:
+            return None
+        return (fixed_sum / total) * 100.0
+    
 # --- Monitor kualitas link ---
 def link_quality_monitor(stop_event):
     while not stop_event.is_set():
-        q, r, l = get_quality()
-        logging.info(f"[LINK] Quality: {q:.2f}% (recv={r}, lost={l})")
-        time.sleep(5)
+        q_radio = get_quality_radio()
+        if q_radio is not None:
+            logging.info(f"[RADIO] Quality: {q_radio:.2f}%")
+        # else:
+        #     q, r, l = get_quality()
+        #     logging.info(f"[LINK] Quality: {q:.2f}% (recv={r}, lost={l})")
+        time.sleep(1)
 
 
 # --- Broadcast kualitas via UDP ---
@@ -96,15 +160,18 @@ def udp_quality_broadcast(stop_event):
 
 
 # --- Logging kualitas ke CSV ---
-def log_quality_csv(stop_event, file_path="link_quality.csv"):
-    with open(file_path, "w", newline="") as csvfile:
-        writer = csv.writer(csvfile)
-        writer.writerow(["timestamp", "quality_percent", "recv", "lost"])
-        while not stop_event.is_set():
-            q, r, l = get_quality()
-            writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), round(q, 3), r, l])
-            csvfile.flush()
-            time.sleep(0.5)
+# def log_quality_csv(stop_event, file_path="link_quality.csv"):
+#     with open(file_path, "w", newline="") as csvfile:
+#         writer = csv.writer(csvfile)
+#         writer.writerow(["timestamp", "quality_percent", "recv", "lost"])
+#         while not stop_event.is_set():
+#             q_radio = get_quality_radio()
+#             if q_radio is not None:
+#                 writer.writerow([ts, "RADIO", round(q_radio,3), "", ""])
+#             # q, r, l = get_quality()
+#             # writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), round(q, 3), r, l])
+#             csvfile.flush()
+#             time.sleep(0.5)
 
 
 # --- Utility ---
@@ -140,19 +207,31 @@ def mav_to_gcs_loop(mav, stop_event, gcs_socket):
                 if msg is None:
                     break
 
-                if msg.get_type() != "BAD_DATA":
+                # if msg.get_type() != "BAD_DATA":
+                #     try:
+                #         # Hitung kualitas link pakai SEQ (telemetry)
+                #         check_link_quality(msg)
+                #         gcs_socket.sendto(msg.get_msgbuf(), ('127.0.0.1', MP_INPUT_PORT))
+
+                #     except Exception:
+                #         logging.error("Serial device dicabut, hentikan mav_to_gcs_loop")
+                #         stop_event.set()
+                #         gcs_socket.close()
+                #         break
+                if msg.get_type() == "BAD_DATA":
+                    continue
+
+                # tangani RADIO_STATUS khusus
+                if msg.get_type() == "RADIO_STATUS":
                     try:
-                        # Hitung kualitas link pakai SEQ (telemetry)
-                        check_link_quality(msg)
-                        gcs_socket.sendto(msg.get_msgbuf(), ('127.0.0.1', MP_INPUT_PORT))
-
-                    except Exception:
-                        logging.error("Serial device dicabut, hentikan mav_to_gcs_loop")
-                        stop_event.set()
-                        gcs_socket.close()
-                        break
-
-                    has_msg = True
+                        handle_radio_status(msg)
+                    except Exception as e:
+                        logging.debug(f"handle_radio_status error: {e}")
+                    # tetap kirim ke MP agar MP juga melihatnya
+                    # continue
+                gcs_socket.sendto(msg.get_msgbuf(), ('127.0.0.1', MP_INPUT_PORT))
+                    # has_msg = True
+                has_msg = True
 
             if has_msg:
                 with lock:
@@ -306,12 +385,20 @@ if __name__ == "__main__":
             mav, link_type = auto_connect(gcs_socket)
             logging.info(f"Koneksi aktif: {link_type}")
 
+            with lock:
+                last_seq = None
+                last_radio = None
+                # juga reset window buffers
+                window.clear()
+                radio_window.clear()
+                last_msg_time = time.time()
+
             t1 = threading.Thread(target=mav_to_gcs_loop, args=(mav, stop_event, gcs_socket), name="MavToGCS")
             wait_for_mission_planner(MP_INPUT_PORT)
             t2 = threading.Thread(target=gcs_to_mav_loop, args=(mav, stop_event, link_type, gcs_socket), name="GCSToMav")
             hb = threading.Thread(target=monitor_heartbeat, args=(mav, stop_event, restart_event, link_type), name="HeartbeatMonitor")
             t3 = threading.Thread(target=link_quality_monitor, args=(stop_event,), daemon=True)
-            t4 = threading.Thread(target=log_quality_csv, args=(stop_event,), daemon=True)
+            # t4 = threading.Thread(target=log_quality_csv, args=(stop_event,), daemon=True)
             t5 = threading.Thread(target=udp_quality_broadcast, args=(stop_event,), daemon=True)
 
             # Start threads
@@ -319,7 +406,7 @@ if __name__ == "__main__":
             t2.start()
             hb.start()
             t3.start()
-            t4.start()
+            # t4.start()
             t5.start()
 
             while not restart_event.is_set():
@@ -338,7 +425,7 @@ if __name__ == "__main__":
             t2.join()
             hb.join()
             t3.join()
-            t4.join()
+            # t4.join()
             t5.join()
 
             time.sleep(1)
