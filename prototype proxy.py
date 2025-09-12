@@ -8,23 +8,23 @@ from logging.handlers import RotatingFileHandler
 from datetime import datetime
 import serial.tools.list_ports
 import psutil
+from collections import deque
 
-# --- Konfigurasi ---
-TELEMETRY_PORT   = 'COM3'
+
+TELEMETRY_PORT   = 'COM6'
 BAUD             = 57600
 MP_INPUT_PORT    = 1805
-MP_OUTPUT_PORT   = 1802    # port forward ke Mission Planner
+# MP_INPUT_PORT    = 14553    
+MP_OUTPUT_PORT   = 1802 
 LINK_QUALITY_PORT = 19000
 TIMEOUT          = 5
 SEQ_LOG_INTERVAL = 50
 timeout_duration = 10
+window = deque()
 
-# --- Variabel global ---
 last_msg_time = time.time()
-recv_count    = 0
-lost_count    = 0
 last_seq      = None
-lock          = threading.Lock()
+lock = threading.Lock()
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -35,32 +35,46 @@ logging.basicConfig(
     ]
 )
 
-
-# --- Kualitas link ---
 def check_link_quality(msg):
     """Hitung paket hilang berdasar sequence number MAVLink"""
-    global last_seq, recv_count, lost_count
+    global last_seq
     try:
         seq = msg.get_seq()
     except:
         return
 
+    now = time.time()
     with lock:
+        lost = 0
         if last_seq is not None:
             expected = (last_seq + 1) % 256
             if seq != expected:
-                lost_count += (seq - expected) % 256
+                diff = (seq - expected) % 256
+                # lost += (seq - expected) % 256
+                if 0 < diff < 128:
+                    lost = diff
+                else:
+                    lost = 0
         last_seq = seq
-        recv_count += 1
+        # recv_count += 1
+        window.append((time.time(), 1, lost))
+
+        cutoff = now - 3.0
+        while window and window[0][0] < cutoff:
+            window.popleft()
 
 
 def get_quality():
     """Return (persen, recv, lost)"""
     with lock:
-        total = recv_count + lost_count
+        if not window:
+            return 0.0, 0, 0
+        recv = sum(r for _, r, _ in window)
+        lost = sum(l for _, _, l in window)
+        total = recv + lost
         if total == 0:
-            return 0.0, recv_count, lost_count
-        return (recv_count / total) * 10000.0, recv_count, lost_count
+            return 0.0, recv, lost
+        return (recv / total) * 100.0, recv, lost
 
 
 # --- Monitor kualitas link ---
@@ -116,7 +130,7 @@ def wait_for_mission_planner(port, timeout=10):
 
 # --- Loop MAVLink → GCS ---
 def mav_to_gcs_loop(mav, stop_event, gcs_socket):
-    global last_seq, recv_count, lost_count, last_msg_time
+    global last_seq, last_msg_time
 
     while not stop_event.is_set():
         try:
@@ -129,15 +143,7 @@ def mav_to_gcs_loop(mav, stop_event, gcs_socket):
                 if msg.get_type() != "BAD_DATA":
                     try:
                         # Hitung kualitas link pakai SEQ (telemetry)
-                        seq = msg.get_seq()
-                        with lock:
-                            if last_seq is not None:
-                                expected = (seq - last_seq) % 256
-                                if seq != expected:
-                                    lost_count += (seq - expected) % 256
-                            last_seq = seq
-                            recv_count += 1
-
+                        check_link_quality(msg)
                         gcs_socket.sendto(msg.get_msgbuf(), ('127.0.0.1', MP_INPUT_PORT))
 
                     except Exception:
@@ -149,11 +155,16 @@ def mav_to_gcs_loop(mav, stop_event, gcs_socket):
                     has_msg = True
 
             if has_msg:
-                last_msg_time = time.time()
-            elif time.time() - last_msg_time > timeout_duration:
-                logging.error("Tidak ada MAVLink valid selama 10 detik, asumsi disconnect.")
-                stop_event.set()
-                break
+                with lock:
+                    last_msg_time = time.time()
+            else:
+                with lock:
+                    delta = time.time() - last_msg_time
+
+                if delta > timeout_duration:
+                    logging.error("Tidak ada MAVLink valid selama 10 detik, asumsi disconnect.")
+                    stop_event.set()
+                    break
 
             time.sleep(0.01)
 
@@ -204,10 +215,10 @@ def gcs_to_mav_loop(mav, stop_event, link_type, gcs_socket):
 # --- Monitor heartbeat ---
 def monitor_heartbeat(mav, stop_event, restart_event, current_link):
     while not stop_event.is_set():
-        try:
-            mav.recv_match(type='HEARTBEAT', blocking=False, timeout=2)
-        except Exception:
-            logging.warning(f"Lost heartbeat on {current_link}, trigger reconnect...")
+        with lock:
+            delta = time.time() - last_msg_time
+        if delta > timeout_duration:
+            logging.warning(f"No MAVLink for {delta:.1f}s > {timeout_duration}s. Trigger reconnect.")
             restart_event.set()
             stop_event.set()
             break
