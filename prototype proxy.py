@@ -3,261 +3,429 @@ import socket
 import time
 import threading
 import logging
-import platform
 import csv
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
 import serial.tools.list_ports
-import queue
-
-TELEMETRY_PORT = 'COM3' #liat di device manager untuk tau com nya
-BAUD = 57600 # umumnya itu
-UDP_PORT_MAV = 1802
-UDP_PORT_MP  = 1805 # nanti masukkan ke MP itu kalo mau di tes
-LINK_QUALITY_PORT = 19000 # nanti sesuaikan dengan program failover
-TIMEOUT = 5
-QUEUE_MAX = 8192
-param_queue = queue.Queue(maxsize=QUEUE_MAX)
-buffer = {}
-param_rate = 0.5
-expected_index = 0
-total_param = None
-PARAM_TIMEOUT = 30
-last_seen_time = time.time()
-param_sync_done = False
+import psutil
+from collections import deque
+import logging
 
 
+TELEMETRY_PORT   = 'COM6'
+BAUD             = 57600
+MP_INPUT_PORT    = 1805
+# MP_INPUT_PORT    = 14553    
+MP_OUTPUT_PORT   = 1802 
+LINK_QUALITY_PORT = 19000
+FORWARD_UDP_IP    = '127.0.0.1'  # Failover listener
+FORWARD_UDP_PORT  = 1810         # Telemetry feed to failover
+TIMEOUT          = 5
+SEQ_LOG_INTERVAL = 50
+timeout_duration = 10
+window = deque()
+radio_window = deque(maxlen=10)
+
+_last_rxerrors = None
+_last_fixed = None
+
+last_radio = None
+last_msg_time = time.time()
+last_seq      = None
+lock = threading.Lock()
 
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
-        RotatingFileHandler("proxy.log", maxBytes=1_000_000, backupCount=3),
+        RotatingFileHandler("hybrid.log", maxBytes=1_000_000, backupCount=3),
         logging.StreamHandler()
     ]
 )
 
-# beep biar tau com kebaca atau ga
-def beep():
-    try:
-        if platform.system() == "Windows":
-            import winsound
-            winsound.Beep(1000, 300)
-        else:
-            print('\a')
-    except:
-        logging.warning("Tidak bisa memutar beep")
-
-last_seq = None
-recv_count = 0
-lost_count = 0
-lock = threading.Lock()
-
 def check_link_quality(msg):
-    global last_seq, recv_count, lost_count
+    """Hitung paket hilang berdasar sequence number MAVLink"""
+    global last_seq
     try:
         seq = msg.get_seq()
     except:
         return
+
+    now = time.time()
     with lock:
+        lost = 0
         if last_seq is not None:
             expected = (last_seq + 1) % 256
             if seq != expected:
-                lost_count += (seq - expected) % 256
+                diff = (seq - expected) % 256
+                # lost += (seq - expected) % 256
+                if 0 < diff < 128:
+                    lost = diff
+                else:
+                    lost = 0
         last_seq = seq
-        recv_count += 1
+        # recv_count += 1
+        window.append((time.time(), 1, lost))
+
+        cutoff = now - 3.0
+        while window and window[0][0] < cutoff:
+            window.popleft()
+
 
 def get_quality():
+    """Return (persen, recv, lost)"""
     with lock:
-        total = recv_count + lost_count
+        if not window:
+            return 0.0, 0, 0
+        recv = sum(r for _, r, _ in window)
+        lost = sum(l for _, _, l in window)
+        total = recv + lost
         if total == 0:
-            return 0.0, recv_count, lost_count
-        return (recv_count / total) * 100.0, recv_count, lost_count
+            return 0.0, recv, lost
+        return (recv / total) * 100.0, recv, lost
 
+def calc_radio_quality(rssi, remrssi, rxerrors, fixed):
+    global _last_rxerrors, _last_fixed
 
-def mav_to_udp_loop(mav, stop_event, udp_out, last_param_time):
-    global buffer, expected_index, total_param, last_seen_time, param_sync_done
-    param_timeout = 5.0
-    while not stop_event.is_set():
-        try:
-            msg = mav.recv_match(blocking=False)
-            if not msg or msg.get_type() == "BAD_DATA":
-                if (not param_sync_done) and (time.time() - last_param_time[0] > param_timeout):
-                    logging.info("[PARAM] Timeout param, dianggap selesai")
-                    param_sync_done = True
-                continue
+    # Normalisasi RSSI (Mission Planner tipikal: 173–174 sudah 100%)
+    def norm(val):
+        return min(100.0, (val / 173.0) * 100.0)
 
-            check_link_quality(msg)
-            if msg.get_type() == "PARAM_VALUE":
-                if param_sync_done:
-                    logging.debug(f"[PARAM] Extra param setelah sync: {msg.param_id}")
-                    continue
-                last_param_time[0] = time.time()
-                if total_param is None:
-                    total_param = msg.param_count
-                    logging.info(f"[PARAM] Total param: {total_param}")
-                idx = msg.param_index
-                
-                if idx < 0 or idx >= 65535:
-                    if total_param and expected_index >= total_param:
-                        logging.debug(f"[PARAM] Index invalid {idx} ({msg.param_id}) diabaikan karena param sudah selesai")
-                        continue
-                    else:
-                        logging.debug(f"[PARAM] Index invalid {idx}, tetap forward: {msg.param_id}")
-                        udp_out.sendto(msg.get_msgbuf(), ('127.0.0.1', UDP_PORT_MP))
-                    continue
-                buffer[idx] = msg
-                while expected_index in buffer:
-                    m = buffer.pop(expected_index)
-                    logging.info(f"[PARAM] {m.param_index}/{total_param-1} {m.param_id} = {m.param_value}")
-                    udp_out.sendto(m.get_msgbuf(), ('127.0.0.1', UDP_PORT_MP))
-                    expected_index += 1
-                    last_seen_time = time.time()
-                
-                if (time.time() - last_seen_time) > 2.0 and buffer:
-                    next_idx = min(buffer.keys())
-                    m = buffer.pop(next_idx)
-                    logging.warning(f"[PARAM] Timeout index {expected_index}, lepas {m.param_index} {m.param_id}")
-                    udp_out.sendto(m.get_msgbuf(), ('127.0.0.1', UDP_PORT_MP))
-                    expected_index = next_idx + 1
-                    last_seen_time = time.time()
+    local_quality = norm(rssi)
+    remote_quality = norm(remrssi)
 
+    # delta error
+    if _last_rxerrors is not None and _last_fixed is not None:
+        delta_err = max(0, rxerrors - _last_rxerrors)
+        delta_fix = max(0, fixed - _last_fixed)
+        total = delta_err + delta_fix
+        if total > 0:
+            error_quality = max(0.0, 100.0 - (delta_err / total) * 100.0)
+        else:
+            error_quality = 100.0
+    else:
+        error_quality = 100.0
 
-                if total_param is not None and expected_index >= total_param:
-                    logging.info("[PARAM] Semua parameter sudah diteruskan ke MP")
-                    param_sync_done = True
-                    continue
-            else:
-                udp_out.sendto(msg.get_msgbuf(), ('127.0.0.1', UDP_PORT_MP))
+    _last_rxerrors, _last_fixed = rxerrors, fixed
 
-            time.sleep(0.001)
+    # Ambil min, tapi kalau error_quality = 100 (tidak ada update error), 
+    # pakai rata-rata local/remote
+    if error_quality == 100.0:
+        return round((local_quality + remote_quality) / 2.0, 2)
+    else:
+        return round(min(local_quality, remote_quality, error_quality), 2)
 
-        except Exception as e:
-            logging.error(f"mav_to_udp_loop error: {e}")
-            stop_event.set()
-            break
+def handle_radio_status(msg):
+    rssi = msg.rssi
+    remrssi = msg.remrssi
+    rxerrors = msg.rxerrors
+    fixed = msg.fixed
 
-    logging.info("mav_to_udp_loop selesai.")
+    logging.debug(f"RADIO_STATUS raw: fixed={fixed} rxerrors={rxerrors} "
+                  f"rssi={rssi} remrssi={remrssi}")
 
-def udp_to_mav_loop(mav, stop_event, udp_in):
-    udp_in.settimeout(1.0)
-    while not stop_event.is_set():
-        try:
-            data, _ = udp_in.recvfrom(4096)
-            mav.write(data)
-        except socket.timeout:
-            continue
-        except Exception as e:
-            logging.error(f"udp_to_mav_loop error: {e}")
-            stop_event.set()
-            break
-    logging.info("udp_to_mav_loop selesai.")
+    quality = calc_radio_quality(rssi, remrssi, rxerrors, fixed)
+    logging.info(f"[RADIO] Quality: {quality:.2f}%")
 
-def param_monitor(stop_event, last_param_time):
-    while not stop_event.is_set():
-        if time.time() - last_param_time[0] > PARAM_TIMEOUT:
-            logging.info("[PARAM] Timeout param, dianggap selesai")
-            param_sync_done = True
-            break
-        time.sleep(1)
-
+def get_quality_radio():
+    """Hitung rata-rata kualitas dari RADIO_STATUS"""
+    with lock:
+        if not radio_window:
+            return None
+        fixed_sum = sum(f for f, _ in radio_window)
+        error_sum = sum(e for _, e in radio_window)
+        total = fixed_sum + error_sum
+        if total == 0:
+            return None
+        return (fixed_sum / total) * 100.0
+    
+# --- Monitor kualitas link ---
 def link_quality_monitor(stop_event):
     while not stop_event.is_set():
-        time.sleep(5)
-        q, r, l = get_quality()
-        logging.info(f"[LINK] Quality: {q:.2f}% (recv={r}, lost={l})")
+        q_radio = get_quality_radio()
+        if q_radio is not None:
+            logging.info(f"[RADIO] Quality: {q_radio:.2f}%")
+        # else:
+        #     q, r, l = get_quality()
+        #     logging.info(f"[LINK] Quality: {q:.2f}% (recv={r}, lost={l})")
+        time.sleep(1)
 
 def udp_quality_broadcast(stop_event):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     while not stop_event.is_set():
-        q, r, l = get_quality()
-        msg = f"{q:.2f},{r},{l}"
+        q_radio = get_quality_radio()
+        if q_radio is not None:
+            msg = f"{q_radio:.2f},0,0"
+        else:
+            q, r, l = get_quality()
+            msg = f"{q:.2f},{r},{l}"
         sock.sendto(msg.encode(), ('127.0.0.1', LINK_QUALITY_PORT))
         time.sleep(1)
 
-def log_quality_csv(stop_event, file_path="link_quality.csv"):
-    with open(file_path, "w", newline="") as csvfile:
-        writer = csv.writer(csvfile)
-        writer.writerow(["timestamp", "quality_percent", "recv", "lost"])
-        while not stop_event.is_set():
-            q, r, l = get_quality()
-            writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), round(q, 3), r, l])
-            csvfile.flush()
-            time.sleep(0.5)
 
-def main():
-    ports = list(serial.tools.list_ports.comports())
-    print("Port serial yang terdeteksi:")
-    for port in ports:
-        print(f" - {port}: {port.description}")
+# --- Logging kualitas ke CSV ---
+# def log_quality_csv(stop_event, file_path="link_quality.csv"):
+#     with open(file_path, "w", newline="") as csvfile:
+#         writer = csv.writer(csvfile)
+#         writer.writerow(["timestamp", "quality_percent", "recv", "lost"])
+#         while not stop_event.is_set():
+#             q_radio = get_quality_radio()
+#             if q_radio is not None:
+#                 writer.writerow([ts, "RADIO", round(q_radio,3), "", ""])
+#             # q, r, l = get_quality()
+#             # writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), round(q, 3), r, l])
+#             csvfile.flush()
+#             time.sleep(0.5)
+
+
+# --- Utility ---
+def wait_for_mission_planner(port, timeout=10):
+    test_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    test_data = b'\xfe\x09\x00\x00\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+    start = time.time()
+
+    while time.time() - start < timeout:
+        try:
+            test_sock.sendto(test_data, ("127.0.0.1", port))
+            logging.info(f"Mengirim dummy ke Mission Planner di port {port}, asumsi aktif.")
+            test_sock.close()
+            return
+        except Exception:
+            logging.info(f"Menunggu Mission Planner bind port {port}...")
+        time.sleep(1)
+
+    logging.warning(f"Timeout menunggu Mission Planner pada port {port}")
+    test_sock.close()
+    return False
+
+def mav_to_gcs_loop(mav, stop_event, gcs_socket):
+    global last_seq, last_msg_time
+
+    while not stop_event.is_set():
+        try:
+            has_msg = False
+            while True:
+                msg = mav.recv_match(blocking=False)
+                if msg is None:
+                    break
+
+                # if msg.get_type() != "BAD_DATA":
+                #     try:
+                #         # Hitung kualitas link pakai SEQ (telemetry)
+                #         check_link_quality(msg)
+                #         gcs_socket.sendto(msg.get_msgbuf(), ('127.0.0.1', MP_INPUT_PORT))
+
+                #     except Exception:
+                #         logging.error("Serial device dicabut, hentikan mav_to_gcs_loop")
+                #         stop_event.set()
+                #         gcs_socket.close()
+                #         break
+                if msg.get_type() == "BAD_DATA":
+                    continue
+
+                # tangani RADIO_STATUS khusus
+                if msg.get_type() == "RADIO_STATUS":
+                    try:
+                        handle_radio_status(msg)
+                    except Exception as e:
+                        logging.debug(f"handle_radio_status error: {e}")
+                    # tetap kirim ke MP agar MP juga melihatnya
+                    # continue
+                gcs_socket.sendto(msg.get_msgbuf(), ('127.0.0.1', MP_INPUT_PORT))
+                    # has_msg = True
+                has_msg = True
+
+            if has_msg:
+                with lock:
+                    last_msg_time = time.time()
+            else:
+                with lock:
+                    delta = time.time() - last_msg_time
+
+                if delta > timeout_duration:
+                    logging.error("Tidak ada MAVLink valid selama 10 detik, asumsi disconnect.")
+                    stop_event.set()
+                    break
+
+            time.sleep(0.01)
+
+        except Exception as e:
+            logging.error(f"mav_to_gcs_loop: {e}")
+            stop_event.set()
+            break
+
+    logging.info("mav_to_gcs_loop selesai.")
+    try:
+        mav.close()
+    except:
+        pass
+
+
+# --- Loop GCS → MAVLink ---
+def gcs_to_mav_loop(mav, stop_event, link_type, gcs_socket):
+    gcs_socket.settimeout(3.0)
+
+    while not stop_event.is_set():
+        try:
+            data, _ = gcs_socket.recvfrom(1024)
+            mav.write(data)
+
+        except serial.SerialException as e:
+            logging.error(f"Serial error: {e}")
+            stop_event.set()
+            gcs_socket.close()
+            break
+
+        except socket.timeout:
+            time.sleep(0.01)
+            continue
+
+        except OSError as e:
+            if e.errno == 10054:
+                logging.warning("Mission Planner menolak koneksi (WinError 10054). Tunggu dan retry...")
+                time.sleep(1)
+                continue
+            else:
+                logging.error(f"gcs_to_mav_loop: {e}")
+                stop_event.set()
+                break
+
+    logging.info("gcs_to_mav_loop selesai.")
+
+def monitor_heartbeat(mav, stop_event, restart_event, current_link):
+    while not stop_event.is_set():
+        with lock:
+            delta = time.time() - last_msg_time
+        if delta > timeout_duration:
+            logging.warning(f"No MAVLink for {delta:.1f}s > {timeout_duration}s. Trigger reconnect.")
+            restart_event.set()
+            stop_event.set()
+            break
+        time.sleep(0.5)
+
+def check_for_telemetry_reconnect(current_link, restart_event):
+    if current_link != "UDP":
+        return
+    while not restart_event.is_set():
+        ports = [p.device for p in serial.tools.list_ports.comports()]
+        if TELEMETRY_PORT in ports:
+            logging.info("[RECOVERY] COM Telemetry tersedia lagi, akan switch kembali.")
+            restart_event.set()
+            break
+        time.sleep(3)
+
+def is_port_in_use(port):
+    try:
+        for conn in psutil.net_connections():
+            if conn.laddr.port == port:
+                return True
+    except Exception as e:
+        logging.warning(f"Error checking port {port}: {e}")
+        return False
+
+def auto_connect(gcs_socket):
+    available_ports = [p.device for p in serial.tools.list_ports.comports()]
+    if TELEMETRY_PORT in available_ports:
+        logging.info(f"[TELEM] {TELEMETRY_PORT} terdeteksi, mencoba koneksi...")
 
     while True:
+        logging.info("[TELEM] Mencoba COM telemetry...")
         try:
-            stop_event = threading.Event()
-            udp_out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            udp_in  = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            udp_in.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            udp_in.bind(('0.0.0.0', UDP_PORT_MAV))
-
-            logging.info(f"Mencoba koneksi ke {TELEMETRY_PORT}...")
             mav = mavutil.mavlink_connection(TELEMETRY_PORT, baud=BAUD)
-            
-            # Cek heartbeat
-            start_time = time.time()
-            heartbeat_received = False
-            while time.time() - start_time < TIMEOUT:
-                msg = mav.recv_match(type='HEARTBEAT', blocking=False)
-                if msg:
-                    heartbeat_received = True
-                    break
-                time.sleep(0.01)
+            logging.info("Port COM berhasil dibuka, menunggu heartbeat...")
 
-            if not heartbeat_received:
-                logging.error("Tidak ada heartbeat, keluar")
-                return
-            logging.info("Heartbeat diterima, kirim PARAM_REQUEST_LIST")
-            mav.mav.param_request_list_send(mav.target_system, mav.target_component)
+            if mav.wait_heartbeat(timeout=TIMEOUT):
+                logging.info("[OK] Heartbeat via telemetry")
+                return mav, "TELEMETRY"
+            else:
+                mav.close()
 
-            last_param_time = [time.time()]
-            threads = [
-                threading.Thread(target=mav_to_udp_loop, args=(mav, stop_event, udp_out, last_param_time), daemon=True),
-                # threading.Thread(target=param_forwarder, args=(stop_event, udp_out), daemon=True),
-                threading.Thread(target=udp_to_mav_loop, args=(mav, stop_event, udp_in), daemon=True),
-                threading.Thread(target=param_monitor, args=(stop_event, last_param_time), daemon=True),
-                threading.Thread(target=link_quality_monitor, args=(stop_event,), daemon=True),
-                threading.Thread(target=log_quality_csv, args=(stop_event,), daemon=True),
-                threading.Thread(target=udp_quality_broadcast, args=(stop_event,), daemon=True)
-            ]
-
-            for t in threads:
-                t.start()
-
-            while not stop_event.is_set():
-                if total_param and time.time() - last_param_time[0] > 30:
-                    logging.info("[PARAM] Timeout tercapai, hentikan request param.")
-                    break
-                time.sleep(1)
-        except KeyboardInterrupt:
-            stop_event.set()
-                # if not any(t.is_alive() for t in threads[:4]):
-                #     logging.error("Thread utama mati, restart...")
-                #     stop_event.set()
-                #     break
-                # time.sleep(1)
-
+        except Exception as e:
+            logging.warning(f"[COM3 Error] Tidak bisa membuka {TELEMETRY_PORT}: {e}")
             try:
                 mav.close()
-                udp_in.close()
-                udp_out.close()
             except:
                 pass
 
-            logging.info("Restart dalam 3 detik...")
-            time.sleep(3)
-
-        except Exception as e:
-            logging.error(f"Error utama: {e}")
-            time.sleep(3)
+        logging.info("Tidak ada koneksi yang berhasil, mencoba lagi dalam 5 detik...")
+        time.sleep(5)
 
 if __name__ == "__main__":
-    main()
+    try:
+        ports = list(serial.tools.list_ports.comports())
+        print("Daftar port serial yang terdeteksi:")
+        for port in ports:
+            print(f"- {port.device} : {port.description}")
+
+        while is_port_in_use(MP_OUTPUT_PORT):
+            logging.warning(f"Port {MP_OUTPUT_PORT} masih digunakan! Menunggu...")
+            time.sleep(3)
+
+        while True:
+            stop_event    = threading.Event()
+            restart_event = threading.Event()
+            gcs_socket    = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            gcs_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+            try:
+                gcs_socket.bind(('127.0.0.1', MP_OUTPUT_PORT))
+            except Exception as e:
+                logging.error(f"Gagal bind port {MP_OUTPUT_PORT}: {e}")
+                stop_event.set()
+                continue
+
+            mav, link_type = auto_connect(gcs_socket)
+            logging.info(f"Koneksi aktif: {link_type}")
+
+            with lock:
+                last_seq = None
+                last_radio = None
+                # juga reset window buffers
+                window.clear()
+                radio_window.clear()
+                last_msg_time = time.time()
+
+            t1 = threading.Thread(target=mav_to_gcs_loop, args=(mav, stop_event, gcs_socket), name="MavToGCS")
+            wait_for_mission_planner(FORWARD_UDP_PORT)
+            t2 = threading.Thread(target=gcs_to_mav_loop, args=(mav, stop_event, link_type, gcs_socket), name="GCSToMav")
+            hb = threading.Thread(target=monitor_heartbeat, args=(mav, stop_event, restart_event, link_type), name="HeartbeatMonitor")
+            t3 = threading.Thread(target=link_quality_monitor, args=(stop_event,), daemon=True)
+            # t4 = threading.Thread(target=log_quality_csv, args=(stop_event,), daemon=True)
+            t5 = threading.Thread(target=udp_quality_broadcast, args=(stop_event,), daemon=True)
+
+            # Start threads
+            t1.start()
+            t2.start()
+            hb.start()
+            t3.start()
+            # t4.start()
+            t5.start()
+
+            while not restart_event.is_set():
+                if not t1.is_alive() or not t2.is_alive():
+                    logging.error("Salah satu thread GCS mati, keluar...")
+                    restart_event.set()
+                time.sleep(0.5)
+
+            stop_event.set()
+            try:
+                mav.close()
+            except:
+                logging.warning("Gagal menutup koneksi MAV")
+
+            t1.join()
+            t2.join()
+            hb.join()
+            t3.join()
+            # t4.join()
+            t5.join()
+
+            time.sleep(1)
+            logging.info("Restarting connection dalam 1 detik...\n")
+            time.sleep(1)
+
+    except KeyboardInterrupt:
+        logging.info("KeyboardInterrupt diterima, menghentikan program...")
+        stop_event.set()
+        gcs_socket.close()
+        time.sleep(0.5)
