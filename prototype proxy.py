@@ -15,6 +15,7 @@ import logging
 TELEMETRY_PORT   = 'COM6'
 BAUD             = 57600
 MP_INPUT_PORT    = 1805
+# MP_INPUT_PORT    = 14553    
 MP_OUTPUT_PORT   = 1802 
 LINK_QUALITY_PORT = 19000
 FORWARD_UDP_IP    = '127.0.0.1'  # Failover listener
@@ -23,7 +24,7 @@ TIMEOUT          = 5
 SEQ_LOG_INTERVAL = 50
 timeout_duration = 10
 window = deque()
-radio_window = deque()
+radio_window = deque(maxlen=10)
 
 _last_rxerrors = None
 _last_fixed = None
@@ -107,7 +108,12 @@ def calc_radio_quality(rssi, remrssi, rxerrors, fixed):
 
     _last_rxerrors, _last_fixed = rxerrors, fixed
 
-    return round(min(local_quality, remote_quality, error_quality), 2)
+    # Ambil min, tapi kalau error_quality = 100 (tidak ada update error), 
+    # pakai rata-rata local/remote
+    if error_quality == 100.0:
+        return round((local_quality + remote_quality) / 2.0, 2)
+    else:
+        return round(min(local_quality, remote_quality, error_quality), 2)
 
 def handle_radio_status(msg):
     rssi = msg.rssi
@@ -119,11 +125,6 @@ def handle_radio_status(msg):
                   f"rssi={rssi} remrssi={remrssi}")
 
     quality = calc_radio_quality(rssi, remrssi, rxerrors, fixed)
-    with lock:
-        radio_window.append((time.time(), quality))
-        cutoff = time.time() - 3.0
-        while radio_window and radio_window[0][0] < cutoff:
-            radio_window.popleft()
     logging.info(f"[RADIO] Quality: {quality:.2f}%")
 
 def get_quality_radio():
@@ -131,13 +132,14 @@ def get_quality_radio():
     with lock:
         if not radio_window:
             return None
-        cutoff = time.time() - 3.0
-        while radio_window and radio_window[0][0] < cutoff:
-            radio_window.popleft()
-        if not radio_window:
+        fixed_sum = sum(f for f, _ in radio_window)
+        error_sum = sum(e for _, e in radio_window)
+        total = fixed_sum + error_sum
+        if total == 0:
             return None
-        return sum(q for _, q in radio_window) / len(radio_window)
+        return (fixed_sum / total) * 100.0
     
+# --- Monitor kualitas link ---
 def link_quality_monitor(stop_event):
     while not stop_event.is_set():
         q_radio = get_quality_radio()
@@ -227,10 +229,10 @@ def mav_to_gcs_loop(mav, stop_event, gcs_socket):
                         handle_radio_status(msg)
                     except Exception as e:
                         logging.debug(f"handle_radio_status error: {e}")
-                try:
-                    gcs_socket.sendto(msg.get_msgbuf(), (FORWARD_UDP_IP, FORWARD_UDP_PORT))
-                except Exception as send_err:
-                    logging.error(f"Gagal forward ke failover {FORWARD_UDP_IP}:{FORWARD_UDP_PORT}: {send_err}")
+                    # tetap kirim ke MP agar MP juga melihatnya
+                    # continue
+                gcs_socket.sendto(msg.get_msgbuf(), ('127.0.0.1', MP_INPUT_PORT))
+                    # has_msg = True
                 has_msg = True
 
             if has_msg:
