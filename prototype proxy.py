@@ -15,14 +15,15 @@ import logging
 TELEMETRY_PORT   = 'COM6'
 BAUD             = 57600
 MP_INPUT_PORT    = 1805
-# MP_INPUT_PORT    = 14553    
 MP_OUTPUT_PORT   = 1802 
 LINK_QUALITY_PORT = 19000
+FORWARD_UDP_IP    = '127.0.0.1'  # Failover listener
+FORWARD_UDP_PORT  = 1810         # Telemetry feed to failover
 TIMEOUT          = 5
 SEQ_LOG_INTERVAL = 50
 timeout_duration = 10
 window = deque()
-radio_window = deque(maxlen=10)
+radio_window = deque()
 
 _last_rxerrors = None
 _last_fixed = None
@@ -106,12 +107,7 @@ def calc_radio_quality(rssi, remrssi, rxerrors, fixed):
 
     _last_rxerrors, _last_fixed = rxerrors, fixed
 
-    # Ambil min, tapi kalau error_quality = 100 (tidak ada update error), 
-    # pakai rata-rata local/remote
-    if error_quality == 100.0:
-        return round((local_quality + remote_quality) / 2.0, 2)
-    else:
-        return round(min(local_quality, remote_quality, error_quality), 2)
+    return round(min(local_quality, remote_quality, error_quality), 2)
 
 def handle_radio_status(msg):
     rssi = msg.rssi
@@ -123,6 +119,11 @@ def handle_radio_status(msg):
                   f"rssi={rssi} remrssi={remrssi}")
 
     quality = calc_radio_quality(rssi, remrssi, rxerrors, fixed)
+    with lock:
+        radio_window.append((time.time(), quality))
+        cutoff = time.time() - 3.0
+        while radio_window and radio_window[0][0] < cutoff:
+            radio_window.popleft()
     logging.info(f"[RADIO] Quality: {quality:.2f}%")
 
 def get_quality_radio():
@@ -130,14 +131,13 @@ def get_quality_radio():
     with lock:
         if not radio_window:
             return None
-        fixed_sum = sum(f for f, _ in radio_window)
-        error_sum = sum(e for _, e in radio_window)
-        total = fixed_sum + error_sum
-        if total == 0:
+        cutoff = time.time() - 3.0
+        while radio_window and radio_window[0][0] < cutoff:
+            radio_window.popleft()
+        if not radio_window:
             return None
-        return (fixed_sum / total) * 100.0
+        return sum(q for _, q in radio_window) / len(radio_window)
     
-# --- Monitor kualitas link ---
 def link_quality_monitor(stop_event):
     while not stop_event.is_set():
         q_radio = get_quality_radio()
@@ -148,13 +148,15 @@ def link_quality_monitor(stop_event):
         #     logging.info(f"[LINK] Quality: {q:.2f}% (recv={r}, lost={l})")
         time.sleep(1)
 
-
-# --- Broadcast kualitas via UDP ---
 def udp_quality_broadcast(stop_event):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     while not stop_event.is_set():
-        q, r, l = get_quality()
-        msg = f"{q:.2f},{r},{l}"
+        q_radio = get_quality_radio()
+        if q_radio is not None:
+            msg = f"{q_radio:.2f},0,0"
+        else:
+            q, r, l = get_quality()
+            msg = f"{q:.2f},{r},{l}"
         sock.sendto(msg.encode(), ('127.0.0.1', LINK_QUALITY_PORT))
         time.sleep(1)
 
@@ -194,8 +196,6 @@ def wait_for_mission_planner(port, timeout=10):
     test_sock.close()
     return False
 
-
-# --- Loop MAVLink → GCS ---
 def mav_to_gcs_loop(mav, stop_event, gcs_socket):
     global last_seq, last_msg_time
 
@@ -227,10 +227,10 @@ def mav_to_gcs_loop(mav, stop_event, gcs_socket):
                         handle_radio_status(msg)
                     except Exception as e:
                         logging.debug(f"handle_radio_status error: {e}")
-                    # tetap kirim ke MP agar MP juga melihatnya
-                    # continue
-                gcs_socket.sendto(msg.get_msgbuf(), ('127.0.0.1', MP_INPUT_PORT))
-                    # has_msg = True
+                try:
+                    gcs_socket.sendto(msg.get_msgbuf(), (FORWARD_UDP_IP, FORWARD_UDP_PORT))
+                except Exception as send_err:
+                    logging.error(f"Gagal forward ke failover {FORWARD_UDP_IP}:{FORWARD_UDP_PORT}: {send_err}")
                 has_msg = True
 
             if has_msg:
@@ -290,8 +290,6 @@ def gcs_to_mav_loop(mav, stop_event, link_type, gcs_socket):
 
     logging.info("gcs_to_mav_loop selesai.")
 
-
-# --- Monitor heartbeat ---
 def monitor_heartbeat(mav, stop_event, restart_event, current_link):
     while not stop_event.is_set():
         with lock:
@@ -303,8 +301,6 @@ def monitor_heartbeat(mav, stop_event, restart_event, current_link):
             break
         time.sleep(0.5)
 
-
-# --- Cek telemetry reconnect ---
 def check_for_telemetry_reconnect(current_link, restart_event):
     if current_link != "UDP":
         return
@@ -316,8 +312,6 @@ def check_for_telemetry_reconnect(current_link, restart_event):
             break
         time.sleep(3)
 
-
-# --- Cek port in use ---
 def is_port_in_use(port):
     try:
         for conn in psutil.net_connections():
@@ -327,8 +321,6 @@ def is_port_in_use(port):
         logging.warning(f"Error checking port {port}: {e}")
         return False
 
-
-# --- Auto connect ke telemetry ---
 def auto_connect(gcs_socket):
     available_ports = [p.device for p in serial.tools.list_ports.comports()]
     if TELEMETRY_PORT in available_ports:
@@ -356,8 +348,6 @@ def auto_connect(gcs_socket):
         logging.info("Tidak ada koneksi yang berhasil, mencoba lagi dalam 5 detik...")
         time.sleep(5)
 
-
-# --- Main ---
 if __name__ == "__main__":
     try:
         ports = list(serial.tools.list_ports.comports())
@@ -394,7 +384,7 @@ if __name__ == "__main__":
                 last_msg_time = time.time()
 
             t1 = threading.Thread(target=mav_to_gcs_loop, args=(mav, stop_event, gcs_socket), name="MavToGCS")
-            wait_for_mission_planner(MP_INPUT_PORT)
+            wait_for_mission_planner(FORWARD_UDP_PORT)
             t2 = threading.Thread(target=gcs_to_mav_loop, args=(mav, stop_event, link_type, gcs_socket), name="GCSToMav")
             hb = threading.Thread(target=monitor_heartbeat, args=(mav, stop_event, restart_event, link_type), name="HeartbeatMonitor")
             t3 = threading.Thread(target=link_quality_monitor, args=(stop_event,), daemon=True)
